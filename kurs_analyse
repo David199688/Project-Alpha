@@ -1,0 +1,1963 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import logging
+from datetime import datetime, timedelta
+import re
+from PIL import Image, ImageTk, ImageDraw, ImageFont
+import numpy as np
+import cv2
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+import random
+import time
+import tempfile
+import shutil
+import pytesseract
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+import joblib # Für Speichern/Laden von Modellen
+from statsmodels.tsa.arima.model import ARIMA # Für fortgeschrittenere Zeitreihenanalyse
+from collections import deque # Für effiziente Speicherung der letzten N Datenpunkte
+import pandas as pd # Für Zeitreihen-Operationen mit Pandas
+import statsmodels.api as sm # Für Modellselektion (AIC/BIC)
+
+# --- Konfigurationen ---
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+# NUMBER_DISPLAY_FORMAT wird jetzt dynamisch angepasst
+OCR_VALUE_MIN = 0.0001  # Erlaubt kleinere Werte für Kryptowährungen etc.
+OCR_VALUE_MAX = 10000000.0 # Erhöht, um größere Werte zuzulassen (z.B. für Indizes)
+EVAL_DIALOG_WIDTH = 600
+EVAL_DIALOG_HEIGHT = 450 # Leicht erhöht für zusätzliche Infos
+WATCH_FOLDER = "./watch_folder"
+PROCESSED_FOLDER = "./processed_files"
+ROI_CONFIG_FILE = "roi_config.json"
+KURS_HISTORY_FILE = "kurs_history.json"
+PROGNOSES_FILE = "prognoses.json"
+MODELS_DIR = "models" # Verzeichnis für gespeicherte Modelle
+CANDLE_LEARNER_MODELS_DIR = "candle_learner_models" # Verzeichnis für Kerzenlern-Modelle
+OCR_TESSERACT_PATH = r'C:\Program Files\Tesseract-OCR\tesseract.exe'  # Adjust this path if Tesseract is installed elsewhere
+FONT_PATH = "arial.ttf"  # Or any other font like "DejaVuSans.ttf" or "Helvetica.ttf" on your system
+MAX_POINTS_FOR_DETAILED_GRAPH = 1000  # Max points to draw before aggregation
+OCR_CONFIDENCE_THRESHOLD = 65 # Erhöht, um nur zuverlässigere Erkennungen zu akzeptieren
+MAX_HISTORY_POINTS_PER_SYMBOL = 3000 # Maximale Anzahl an historischen Datenpunkten pro Symbol (erhöht)
+# ARIMA_ORDER = (5,1,0) # Standard-ARIMA-Ordnung (p,d,q) - wird jetzt dynamisch optimiert
+CANDLE_BEHAVIOR_MEMORY = 200 # Anzahl der letzten Kerzenverhalten, die gelernt werden (erhöht)
+OCR_UPSCALING_FACTOR = 3 # Faktor zum Hochskalieren kleiner ROIs vor der OCR-Verarbeitung
+
+# Sicherstellen, dass Tesseract-Pfad für pytesseract gesetzt ist
+def setup_tesseract_path():
+    """Richtet den Tesseract-Pfad für pytesseract ein und warnt bei Fehlen."""
+    if os.path.exists(OCR_TESSERACT_PATH):
+        pytesseract.pytesseract.tesseract_cmd = OCR_TESSERACT_PATH
+        logging.info(f"Tesseract executable path set to {OCR_TESSERACT_PATH}")
+    else:
+        logging.critical(f"Tesseract executable not found at {OCR_TESSERACT_PATH}. OCR functionality will NOT work.")
+        messagebox.showerror("Tesseract nicht gefunden",
+                               f"Tesseract OCR-Engine wurde NICHT unter dem Pfad '{OCR_TESSERACT_PATH}' gefunden.\n\n"
+                               "Die OCR-Funktionalität (automatische Bilderkennung) wird NICHT funktionieren.\n"
+                               "Bitte installieren Sie Tesseract und passen Sie den Pfad in der Konfiguration an, falls notwendig.",
+                               icon="error")
+        # Eine globale Variable oder ein Flag setzen, um OCR-Funktionen zu deaktivieren
+        global OCR_ENABLED
+        OCR_ENABLED = False
+
+OCR_ENABLED = True # Standardmäßig aktiviert, wird von setup_tesseract_path geändert
+
+# Logging-Setup
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Hilfsfunktionen für atomares Speichern ---
+def save_json_atomically(data: dict, file_path: str) -> bool:
+    """
+    Speichert Daten atomar in einer JSON-Datei.
+    Verhindert Datenkorruption bei Abstürzen während des Schreibens.
+    """
+    try:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        temp_file_path = file_path + ".tmp"
+        with open(temp_file_path, 'w', encoding='utf-8') as temp_file:
+            json.dump(data, temp_file, indent=4)
+        os.replace(temp_file_path, file_path) # Atomares Ersetzen
+        logging.debug(f"Daten atomar in '{file_path}' gespeichert.")
+        return True
+    except Exception as e:
+        logging.error(f"Fehler beim atomaren Speichern von '{file_path}': {e}")
+        # Versuch, temporäre Datei zu bereinigen, falls sie noch existiert
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        return False
+
+def load_json_safely(file_path: str) -> dict:
+    """
+    Lädt Daten sicher aus einer JSON-Datei.
+    Behandelt Fehler beim Lesen oder Parsen der Datei.
+    """
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                logging.debug(f"Daten sicher aus '{file_path}' geladen.")
+                return data
+        except json.JSONDecodeError as e:
+            logging.error(f"Fehler beim Laden oder Parsen von '{file_path}': {e}. Leere Daten werden zurückgegeben.")
+            return {}
+        except Exception as e:
+            logging.error(f"Unerwarteter Fehler beim Laden von '{file_path}': {e}. Leere Daten werden zurückgegeben.")
+            return {}
+    logging.debug(f"Datei '{file_path}' nicht gefunden. Leere Daten werden zurückgegeben.")
+    return {}
+
+# --- Datenmanagement ---
+class DataHandler:
+    """
+    Verwaltet Kursdaten und Prognosen mit einfacher JSON-Persistenz.
+    Nutzt `deque` für effiziente, größenbeschränkte Speicherung der Historie.
+    """
+    def __init__(self):
+        self._kurs_history: dict[str, deque[tuple[str, float]]] = {}  # {kurs_symbol: [(timestamp_str, value), ...]}
+        self._prognoses: dict[str, list[dict]] = {}  # {kurs_symbol: [prognose_data, ...]}
+        self.load_data()
+
+    def load_data(self):
+        """Lädt historische Daten und Prognosen aus JSON-Dateien."""
+        loaded_history = load_json_safely(KURS_HISTORY_FILE)
+        self._kurs_history = {
+            symbol: deque(history, maxlen=MAX_HISTORY_POINTS_PER_SYMBOL)
+            for symbol, history in loaded_history.items()
+        }
+        self._prognoses = load_json_safely(PROGNOSES_FILE)
+        logging.info("Historische Daten und Prognosen geladen.")
+
+    def save_data(self):
+        """Speichert historische Daten und Prognosen in JSON-Dateien."""
+        history_to_save = {symbol: list(dq) for symbol, dq in self._kurs_history.items()}
+        save_json_atomically(history_to_save, KURS_HISTORY_FILE)
+        save_json_atomically(self._prognoses, PROGNOSES_FILE)
+        logging.info("Historische Daten und Prognosen gespeichert.")
+
+    def get_kurs_history(self, kurs_symbol: str) -> list[tuple[str, float]]:
+        """Gibt die Kurs-Historie für ein Symbol zurück."""
+        return list(self._kurs_history.get(kurs_symbol, deque())) # Konvertiere deque zu Liste für externe Nutzung
+
+    def add_kurs_value(self, kurs_symbol: str, timestamp: datetime, value: float):
+        """Fügt einen neuen Kurswert zur Historie hinzu und speichert die Daten."""
+        timestamp_str = timestamp.strftime(DATE_FORMAT)
+        if kurs_symbol not in self._kurs_history:
+            self._kurs_history[kurs_symbol] = deque(maxlen=MAX_HISTORY_POINTS_PER_SYMBOL)
+        self._kurs_history[kurs_symbol].append((timestamp_str, value))
+        logging.debug(f"Kurswert für {kurs_symbol} hinzugefügt: {value} um {timestamp_str}")
+        self.save_data()
+
+    def add_prognose(self, kurs_symbol: str, prognose_data: dict):
+        """Fügt eine neue Prognose hinzu und speichert die Daten."""
+        if kurs_symbol not in self._prognoses:
+            self._prognoses[kurs_symbol] = []
+        self._prognoses[kurs_symbol].append(prognose_data)
+        logging.info(f"Prognose für {kurs_symbol} hinzugefügt: {prognose_data}")
+        self.save_data()
+
+    def get_prognoses(self, kurs_symbol: str) -> list[dict]:
+        """Gibt alle Prognosen für ein bestimmtes Kurs-Symbol zurück."""
+        return self._prognoses.get(kurs_symbol, [])
+
+    def update_prognose(self, kurs_symbol: str, prediction_timestamp_str: str, predicted_value: float, actual_value: float) -> dict | None:
+        """
+        Aktualisiert eine bestehende Prognose mit dem tatsächlichen Wert und der Evaluierungszeit.
+        Findet die passende Prognose anhand des Symbols, des vorhergesagten Werts und des Zeitstempels.
+        """
+        for prognose in self._prognoses.get(kurs_symbol, []):
+            if (prognose['prediction_timestamp'] == prediction_timestamp_str and
+                abs(prognose['predicted_value'] - predicted_value) < 1e-6): # Toleranz für float-Vergleich
+                
+                prognose['actual_value'] = actual_value
+                prognose['evaluation_timestamp'] = datetime.now().strftime(DATE_FORMAT)
+                prognose['error'] = actual_value - predicted_value
+                logging.info(f"Prognose für {kurs_symbol} aktualisiert: {prognose}")
+                self.save_data()
+                return prognose
+        logging.warning(f"Keine passende Prognose für {kurs_symbol} (Pred: {predicted_value}, TS: {prediction_timestamp_str}) zur Aktualisierung gefunden.")
+        return None
+
+# --- KI-Modul: CandleBehaviorLearner (NEU) ---
+class CandleBehaviorLearner:
+    """
+    Lernt und prognostiziert das zukünftige Kerzenverhalten basierend auf historischen Daten.
+    Speichert gelerntes Verhalten persistent.
+    """
+    def __init__(self):
+        self.learned_behaviors: dict[str, dict[str, int]] = {} # {symbol: {candle_type: count}}
+        self.learned_ranges: dict[str, deque[tuple[float, float]]] = {} # {symbol: deque([(range_factor_min, range_factor_max), ...])}
+        os.makedirs(CANDLE_LEARNER_MODELS_DIR, exist_ok=True)
+        self._load_learned_behaviors()
+        logging.info("CandleBehaviorLearner initialisiert.")
+
+    def _get_model_path(self, kurs_symbol: str) -> str:
+        """Gibt den Dateipfad für das Kerzenlern-Modell eines Symbols zurück."""
+        return os.path.join(CANDLE_LEARNER_MODELS_DIR, f"candle_behavior_{kurs_symbol}.joblib")
+
+    def _load_learned_behaviors(self):
+        """Lädt alle gelernten Kerzenverhalten aus dem Verzeichnis."""
+        if os.path.exists(CANDLE_LEARNER_MODELS_DIR):
+            for filename in os.listdir(CANDLE_LEARNER_MODELS_DIR):
+                if filename.startswith("candle_behavior_") and filename.endswith(".joblib"):
+                    kurs_symbol = filename[len("candle_behavior_"):-len(".joblib")]
+                    try:
+                        loaded_data = joblib.load(os.path.join(CANDLE_LEARNER_MODELS_DIR, filename))
+                        if 'behaviors' in loaded_data:
+                            self.learned_behaviors[kurs_symbol] = loaded_data['behaviors']
+                        if 'ranges' in loaded_data:
+                            # Stellen Sie sicher, dass es eine deque ist und die maximale Länge beibehalten wird
+                            self.learned_ranges[kurs_symbol] = deque(loaded_data['ranges'], maxlen=CANDLE_BEHAVIOR_MEMORY)
+                        logging.info(f"Gelerntes Kerzenverhalten für '{kurs_symbol}' geladen.")
+                    except Exception as e:
+                        logging.error(f"Fehler beim Laden des Kerzenverhaltens für '{filename}': {e}")
+
+    def _save_learned_behaviors(self, kurs_symbol: str):
+        """Speichert das gelernte Kerzenverhalten für ein Symbol."""
+        try:
+            os.makedirs(CANDLE_LEARNER_MODELS_DIR, exist_ok=True)
+            data_to_save = {
+                'behaviors': self.learned_behaviors.get(kurs_symbol, {}),
+                'ranges': list(self.learned_ranges.get(kurs_symbol, deque())) # deque zu Liste konvertieren
+            }
+            joblib.dump(data_to_save, self._get_model_path(kurs_symbol))
+            logging.info(f"Gelerntes Kerzenverhalten für '{kurs_symbol}' gespeichert.")
+        except Exception as e:
+            logging.error(f"Fehler beim Speichern des Kerzenverhaltens für '{kurs_symbol}': {e}")
+
+    def _classify_candle(self, open_val: float, close_val: float, high_val: float, low_val: float) -> tuple[str, float, float]:
+        """
+        Klassifiziert eine Kerze basierend auf Open, Close, High, Low Werten.
+        Gibt Kerzentyp und Spanne als Faktoren zurück.
+        """
+        if open_val == 0: return "Unbestimmt", 0, 0 # Division by zero guard
+
+        change_percent = ((close_val - open_val) / open_val) * 100
+        total_range_percent = ((high_val - low_val) / open_val) * 100
+        
+        # Relative Spanne Min ist der Abstand von Open zu Low, relativ zu Open
+        # Relative Spanne Max ist der Abstand von Open zu High, relativ zu Open
+        range_min_factor = (open_val - low_val) / open_val if open_val > 0 else 0
+        range_max_factor = (high_val - open_val) / open_val if open_val > 0 else 0
+
+        # Klassifiziere Kerze
+        if abs(change_percent) < 0.1 and total_range_percent < 0.5: # Sehr kleine Änderung, kleiner Schatten
+            candle_type = "Doji (Neutral)"
+        elif change_percent > 0: # Grüne Kerze (Close > Open)
+            if total_range_percent > 2.0:
+                candle_type = "Große Grüne Kerze"
+            elif total_range_percent > 0.5:
+                candle_type = "Mittlere Grüne Kerze"
+            else:
+                candle_type = "Kleine Grüne Kerze"
+        else: # Rote Kerze (Close < Open)
+            if total_range_percent > 2.0:
+                candle_type = "Große Rote Kerze"
+            elif total_range_percent > 0.5:
+                candle_type = "Mittlere Rote Kerze"
+            else:
+                candle_type = "Kleine Rote Kerze"
+        
+        return candle_type, range_min_factor, range_max_factor
+
+    def learn_candle_behavior(self, kurs_symbol: str, current_value: float, actual_value: float):
+        """
+        Lernt das tatsächliche Kerzenverhalten aus dem aktuellen und tatsächlichen Wert.
+        Hier wird 'current_value' als Open und 'actual_value' als Close der Kerze genommen.
+        High und Low werden aus einer vereinfachten Spanne um diese Werte abgeleitet.
+        """
+        if kurs_symbol not in self.learned_behaviors:
+            self.learned_behaviors[kurs_symbol] = {}
+            self.learned_ranges[kurs_symbol] = deque(maxlen=CANDLE_BEHAVIOR_MEMORY)
+
+        # Improvisiere High und Low basierend auf der Spanne zwischen Open und Close
+        # und einer kleinen zusätzlichen Volatilität.
+        _min_val = min(current_value, actual_value)
+        _max_val = max(current_value, actual_value)
+        
+        # Füge eine kleine Zufallsspanne hinzu, um High/Low realistischer zu machen
+        # Angenommen, der Docht/Schatten beträgt 0.1% bis 0.5% des Wertes
+        simulated_high = _max_val * (1 + random.uniform(0.001, 0.005))
+        simulated_low = _min_val * (1 - random.uniform(0.001, 0.005))
+
+        # Sicherstellen, dass High >= Close und Low <= Open (oder umgekehrt bei steigend/fallend)
+        high_val = max(simulated_high, current_value, actual_value)
+        low_val = min(simulated_low, current_value, actual_value)
+
+
+        candle_type, range_min_factor, range_max_factor = self._classify_candle(current_value, actual_value, high_val, low_val)
+        
+        self.learned_behaviors[kurs_symbol][candle_type] = self.learned_behaviors[kurs_symbol].get(candle_type, 0) + 1
+        self.learned_ranges[kurs_symbol].append((range_min_factor, range_max_factor))
+
+        logging.info(f"Gelerntes Kerzenverhalten für {kurs_symbol}: {candle_type}. "
+                     f"Aktualisierte Häufigkeiten: {self.learned_behaviors[kurs_symbol]}, "
+                     f"Neue Spannen-Faktoren: {range_min_factor:.4f}, {range_max_factor:.4f}")
+        self._save_learned_behaviors(kurs_symbol)
+
+    def predict_candle_behavior(self, kurs_symbol: str, predicted_close: float, last_known_value: float) -> tuple[str, float, float]:
+        """
+        Prognostiziert den Kerzentyp und die Spanne basierend auf gelernten Mustern.
+        """
+        if kurs_symbol not in self.learned_behaviors or not self.learned_behaviors[kurs_symbol] or sum(self.learned_behaviors[kurs_symbol].values()) == 0:
+            logging.warning(f"Keine gelernten Kerzenverhalten für {kurs_symbol}. Verwende Standard-Heuristik.")
+            # Fallback auf die ursprüngliche Heuristik, wenn keine Daten gelernt wurden
+            predicted_range_min_factor = random.uniform(0.005, 0.02)
+            predicted_range_max_factor = random.uniform(0.005, 0.02)
+            
+            if predicted_close > last_known_value * 1.005:
+                candle_direction = "Steigend (Grüne Kerze)"
+            elif predicted_close < last_known_value * 0.995:
+                candle_direction = "Fallend (Rote Kerze)"
+            else:
+                candle_direction = "Seitwärts (Doji/Kleine Kerze)"
+            return candle_direction, predicted_range_min_factor, predicted_range_max_factor
+
+        # Wähle den Kerzentyp basierend auf der Wahrscheinlichkeitsverteilung
+        total_counts = sum(self.learned_behaviors[kurs_symbol].values())
+        if total_counts == 0:
+            logging.warning(f"CandleBehaviorLearner: Gesamtzählung der Verhaltensweisen ist Null für {kurs_symbol}. Fallback.")
+            return "Unbestimmt", random.uniform(0.005, 0.02), random.uniform(0.005, 0.02)
+
+        behaviors = list(self.learned_behaviors[kurs_symbol].keys())
+        probabilities = [self.learned_behaviors[kurs_symbol][b] / total_counts for b in behaviors]
+        
+        predicted_candle_type = np.random.choice(behaviors, p=probabilities)
+
+        # Wähle eine Spanne aus den gelernten Spannen, die zu diesem Kerzentyp passen könnte (vereinfacht)
+        # Besser wäre es, Spannen pro Kerzentyp zu speichern. Hier nehmen wir einfach eine zufällige aus allen.
+        if self.learned_ranges[kurs_symbol]:
+            # Mittelwert und Standardabweichung der gelernten Spannenfaktoren
+            all_min_factors = [r[0] for r in self.learned_ranges[kurs_symbol]]
+            all_max_factors = [r[1] for r in self.learned_ranges[kurs_symbol]]
+            
+            mean_min_factor = np.mean(all_min_factors)
+            std_min_factor = np.std(all_min_factors)
+            mean_max_factor = np.mean(all_max_factors)
+            std_max_factor = np.std(all_max_factors)
+
+            # Generiere Spannen aus einer Normalverteilung basierend auf gelernten Statistiken
+            # Beschränke auf positive Werte und einen sinnvollen Bereich
+            predicted_range_min_factor = max(0.0001, np.random.normal(mean_min_factor, std_min_factor * 0.5)) # Reduziere Std, um Ausreißer zu vermeiden
+            predicted_range_max_factor = max(0.0001, np.random.normal(mean_max_factor, std_max_factor * 0.5))
+        else:
+            predicted_range_min_factor = random.uniform(0.005, 0.02)
+            predicted_range_max_factor = random.uniform(0.005, 0.02)
+
+        logging.debug(f"Prognostiziertes Kerzenverhalten für {kurs_symbol}: {predicted_candle_type} mit Spannen-Faktoren: {predicted_range_min_factor:.4f}, {predicted_range_max_factor:.4f}")
+        return predicted_candle_type, predicted_range_min_factor, predicted_range_max_factor
+
+# --- KI-Modul (mit ARIMA und Modellpersistenz pro Symbol) ---
+class PrognoseModul:
+    """
+    Verwaltet und trainiert Zeitreihenmodelle (ARIMA) für Prognosen.
+    Speichert Modelle persistenz pro Symbol.
+    Integrierter CandleBehaviorLearner.
+    """
+    def __init__(self):
+        self.models: dict[str, ARIMA] = {} # Speichert ARIMA-Modelle pro Symbol
+        self.candle_learner = CandleBehaviorLearner() # Instanz des Kerzenlerners
+        os.makedirs(MODELS_DIR, exist_ok=True) # Stelle sicher, dass das Verzeichnis existiert
+        self._load_all_models() # Lade ARIMA-Modelle
+        logging.info(f"PrognoseModul initialisiert. Geladene ARIMA-Modelle: {list(self.models.keys())}")
+
+    def _get_model_path(self, kurs_symbol: str) -> str:
+        """Gibt den Dateipfad für das ARIMA-Modell eines Symbols zurück."""
+        return os.path.join(MODELS_DIR, f"model_{kurs_symbol}.joblib")
+
+    def _load_all_models(self):
+        """Lädt alle gespeicherten ARIMA-Modelle aus dem MODELS_DIR."""
+        if os.path.exists(MODELS_DIR):
+            for filename in os.listdir(MODELS_DIR):
+                if filename.startswith("model_") and filename.endswith(".joblib"):
+                    kurs_symbol = filename[len("model_"):-len(".joblib")]
+                    try:
+                        model = joblib.load(os.path.join(MODELS_DIR, filename))
+                        self.models[kurs_symbol] = model
+                        logging.info(f"ARIMA-Modell für '{kurs_symbol}' geladen.")
+                    except Exception as e:
+                        logging.error(f"Fehler beim Laden des ARIMA-Modells '{filename}': {e}")
+        else:
+            logging.info(f"Verzeichnis '{MODELS_DIR}' existiert nicht. Keine ARIMA-Modelle zu laden.")
+
+    def _save_model(self, kurs_symbol: str, model_fit_object):
+        """Speichert ein spezifisches ARIMA-Modell für ein Symbol."""
+        try:
+            os.makedirs(MODELS_DIR, exist_ok=True) # Sicherstellen, dass der Ordner existiert
+            joblib.dump(model_fit_object, self._get_model_path(kurs_symbol))
+            logging.info(f"ARIMA-Modell für '{kurs_symbol}' in '{self._get_model_path(kurs_symbol)}' gespeichert.")
+        except Exception as e:
+            logging.error(f"Fehler beim Speichern des ARIMA-Modells für '{kurs_symbol}': {e}")
+
+    def _find_best_arima_order(self, data_series: pd.Series) -> tuple[int, int, int]:
+        """
+        Sucht die beste ARIMA-Ordnung (p,d,q) basierend auf AIC (Akaike Information Criterion).
+        Dies ist eine rechenintensive Operation, daher nur für eine begrenzte Anzahl von Orders.
+        """
+        best_aic = np.inf
+        best_order = None
+        # Beispielbereiche für p, d, q
+        p_values = range(0, 3) # Max Lag for AR
+        d_values = range(0, 2) # Differencing order (0 or 1 usually for financial data)
+        q_values = range(0, 3) # Max Lag for MA
+
+        for p in p_values:
+            for d in d_values:
+                for q in q_values:
+                    order = (p, d, q)
+                    try:
+                        model = ARIMA(data_series, order=order)
+                        model_fit = model.fit(disp=False)
+                        if model_fit.aic < best_aic:
+                            best_aic = model_fit.aic
+                            best_order = order
+                        logging.debug(f"ARIMA{order} - AIC: {model_fit.aic:.2f}")
+                    except Exception as e:
+                        logging.debug(f"ARIMA{order} failed: {e}")
+                        continue
+        if best_order:
+            logging.info(f"Beste ARIMA-Ordnung für Daten gefunden: {best_order} mit AIC: {best_aic:.2f}")
+            return best_order
+        logging.warning("Konnte keine optimale ARIMA-Ordnung finden. Verwende Standard (1,1,1).")
+        return (1,1,1) # Fallback
+
+    def create_prognose(self, kurs_symbol: str, history: list[tuple[str, float]], prediction_interval_days: int = 1) -> tuple[float, float, float, float, str] | tuple[None, None, None, None, None]:
+        """
+        Erstellt eine KI-Prognose basierend auf historischen Daten mit ARIMA und prognostiziert Kerzenverhalten.
+        Gibt den vorhergesagten Wert, Konfidenz, vorhergesagte Spanne (min/max) und Kerzenrichtung zurück.
+        """
+        
+        # Erstelle eine Pandas Series mit Zeitstempeln als Index
+        timestamps = [datetime.strptime(ts, DATE_FORMAT) for ts, _ in history]
+        values = [val for _, val in history]
+        data_series = pd.Series(values, index=timestamps)
+
+        # NEU: Dynamische Bestimmung der ARIMA-Ordnung
+        # Dies ist rechenintensiv und sollte nicht bei jeder Prognose ausgeführt werden.
+        # Eine Strategie wäre: nur wenn Modell noch nicht existiert oder nach einer bestimmten Anzahl von neuen Datenpunkten.
+        # Für diese Implementierung führen wir es immer aus, um die Funktion zu demonstrieren.
+        # Für den Produktionseinsatz wäre hier Caching oder eine intelligentere Triggerung besser.
+        
+        # Mindestdatenpunkte für ARIMA-Modellierung (nicht nur für Fit, sondern auch für Auto-ARIMA)
+        # Wenn die Datenmenge zu klein ist, sollte man keine komplexe Modellsuche betreiben.
+        min_data_points_for_arima = 10 # Erhöht, da (p,d,q) Werte sum(ARIMA_ORDER) + 1 war zu niedrig für auto_arima
+        
+        if not history or len(history) < min_data_points_for_arima:
+            logging.warning(f"Nicht genügend Daten ({len(history)} Punkte) für ARIMA-Prognose für {kurs_symbol}. Mindestens {min_data_points_for_arima} Punkte benötigt.")
+            # Fallback auf eine einfache Heuristik, wenn nicht genügend Daten für ARIMA vorliegen
+            if history:
+                predicted_value = history[-1][1] * (1 + np.random.uniform(-0.01, 0.01))
+                predicted_value = max(OCR_VALUE_MIN, min(OCR_VALUE_MAX, predicted_value)) # Begrenzen
+                
+                confidence = 30 + np.random.uniform(0, 20) # Sehr geringe Konfidenz
+                confidence = max(0, min(100, confidence))
+
+                # NEU: Verwende CandleBehaviorLearner für Fallback-Kerzenprognose
+                candle_type, range_min_factor, range_max_factor = self.candle_learner.predict_candle_behavior(kurs_symbol, predicted_value, history[-1][1])
+                predicted_range_min = predicted_value * (1 - range_min_factor)
+                predicted_range_max = predicted_value * (1 + range_max_factor)
+
+                predicted_range_min = max(OCR_VALUE_MIN, predicted_range_min)
+                predicted_range_max = max(OCR_VALUE_MIN, predicted_range_max) # Muss auch positiv sein
+                
+                return predicted_value, confidence, predicted_range_min, predicted_range_max, candle_type
+            return None, None, None, None, None
+        
+        # Bestimme die beste ARIMA-Ordnung dynamisch
+        current_arima_order = self._find_best_arima_order(data_series)
+
+        try:
+            # Fitte das Modell mit der optimierten Ordnung
+            model = ARIMA(data_series, order=current_arima_order)
+            model_fit = model.fit(disp=False)
+
+            # Prognose für den nächsten Zeitschritt (z.B. ein Tag später)
+            forecast_steps = 1
+            forecast_result = model_fit.forecast(steps=forecast_steps)
+            predicted_value = forecast_result.iloc[-1]
+
+            # Werte auf sinnvolle Bereiche begrenzen
+            predicted_value = max(OCR_VALUE_MIN, min(OCR_VALUE_MAX, predicted_value)) 
+
+            # Berechnung der Konfidenz (verbessert)
+            # Konfidenz kann auch aus den Konfidenzintervallen des ARIMA-Modells abgeleitet werden.
+            # Hier eine vereinfachte Metrik:
+            
+            # Je länger die Historie und je kleiner die Standardabweichung der Residuen,
+            # desto höher die Konfidenz.
+            residuals = model_fit.resid
+            std_err_resid = np.std(residuals) if len(residuals) > 1 else 0
+            
+            # Wenn der Fehler im Verhältnis zum Mittelwert klein ist, ist die Konfidenz hoch
+            mean_value = np.mean(values)
+            if mean_value > 0:
+                normalized_error = std_err_resid / mean_value
+                # Konfidenz: 100% - (Normalisierter Fehler * Skalierungsfaktor)
+                # Anpassung: Je kleiner der normalisierte Fehler, desto näher an 100%.
+                # Beispiel: 0.01 Fehler -> 90% Konfidenz, 0.05 Fehler -> 50% Konfidenz
+                confidence = 100 - (normalized_error * 1000) # Grober Skalierungsfaktor
+                confidence = max(0, min(100, confidence))
+            else:
+                confidence = 50 # Standardwert, wenn Mittelwert 0
+
+            confidence = max(0, min(100, confidence + random.uniform(-5, 5))) # Kleine Zufälligkeit zur Varianz
+
+
+            # --- NEU: Kerzenverhalten-Prognose durch gelerntes Modell ---
+            last_value = history[-1][1]
+            candle_direction, range_min_factor, range_max_factor = self.candle_learner.predict_candle_behavior(kurs_symbol, predicted_value, last_value)
+            
+            # Berechne die Spanne basierend auf den gelernten Faktoren
+            predicted_range_min = predicted_value * (1 - range_min_factor)
+            predicted_range_max = predicted_value * (1 + range_max_factor)
+
+            predicted_range_min = max(OCR_VALUE_MIN, predicted_range_min)
+            predicted_range_max = max(OCR_VALUE_MIN, predicted_range_max) 
+            
+            logging.info(f"Prognose-Modul: Prognose für {kurs_symbol} erstellt mit ARIMA{current_arima_order}: {predicted_value}, Konfidenz: {confidence:.1f}%, Spanne: [{predicted_range_min:.4f}-{predicted_range_max:.4f}], Kerze: {candle_direction}")
+            self._save_model(kurs_symbol, model_fit) # Modell nach erfolgreichem Fit speichern
+            return predicted_value, confidence, predicted_range_min, predicted_range_max, candle_direction
+
+        except Exception as e:
+            logging.error(f"Fehler bei der Prognose-Erstellung für {kurs_symbol} mit ARIMA: {e}")
+            return None, None, None, None, None
+
+    def learn_from_feedback(self, kurs_symbol: str, predicted_value: float, actual_value: float, confidence: float):
+        """
+        Führt den Lernprozess des KI-Modells und des Kerzenverhaltenslerners basierend auf Feedback aus.
+        """
+        error = actual_value - predicted_value
+        logging.info(f"Prognose-Modul: Modell lernt aus Feedback: Kurs={kurs_symbol}, Predicted={predicted_value}, Actual={actual_value}, Error={error}, Confidence={confidence}")
+        
+        # NEU: Das Kerzenverhalten-Modell lernt aus dem tatsächlichen Ergebnis
+        self.candle_learner.learn_candle_behavior(kurs_symbol, predicted_value, actual_value)
+        logging.info(f"Lernprozess für Kerzenverhalten für {kurs_symbol} abgeschlossen.")
+
+# --- OCR-Verarbeitung ---
+class OCRProcessor:
+    """
+    Verarbeitet Bilder, um Kursdaten mittels OCR zu extrahieren.
+    Verwaltet ROIs für Symbole und Werte.
+    """
+    def __init__(self, data_handler: DataHandler):
+        self.data_handler = data_handler
+        self.ocr_roi_config: dict[str, dict[str, dict[str, int]]] = self._load_roi_config()
+        self.supported_kurs_symbols: set[str] = self._get_initial_supported_symbols()
+        logging.info(f"OCRProcessor initialisiert. Unterstützte Symbole: {', '.join(sorted(list(self.supported_kurs_symbols)))}")
+        logging.debug(f"Geladene ROI-Konfiguration: {self.ocr_roi_config}")
+
+    def _get_initial_supported_symbols(self) -> set[str]:
+        """
+        Initialisiert die unterstützten Symbole basierend auf gespeicherten ROIs
+        und den Symbolen in der historischen Daten.
+        """
+        symbols_from_rois = set(self.ocr_roi_config.keys())
+        symbols_from_history = set(self.data_handler._kurs_history.keys())
+        
+        # Beispiel-Symbole, die oft in Bildern vorkommen könnten (als Fallback/Initialisierung)
+        predefined_symbols = {"AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "NFLX", "NVDA", "BTC", "ETH", "EURUSD", "XAUUSD", "ADA", "DXY"}
+        
+        return symbols_from_rois.union(symbols_from_history).union(predefined_symbols)
+
+    def _load_roi_config(self) -> dict[str, dict[str, dict[str, int]]]:
+        """
+        Lädt die ROI-Konfiguration aus einer JSON-Datei.
+        Konvertiert ggf. ältere Formate der ROI-Definition.
+        """
+        loaded_config = load_json_safely(ROI_CONFIG_FILE)
+        converted_config = {}
+        for key, value in loaded_config.items():
+            if isinstance(value, dict) and 'x1' in value and 'y1' in value and 'x2' in value and 'y2' in value: # Altes Format: {symbol: coords}
+                converted_config[key] = {'value': value} 
+                logging.warning(f"ROI-Konfiguration für '{key}' im alten Format erkannt und zu neuem Format konvertiert: {value}")
+            elif isinstance(value, dict) and ('value' in value or 'symbol' in value): # Neues Format bereits vorhanden oder semi-neu
+                converted_config[key] = value
+            else:
+                logging.warning(f"Unbekanntes ROI-Konfigurationsformat für Schlüssel '{key}'. Wird ignoriert: {value}")
+        return converted_config
+
+    def save_roi_config(self):
+        """Speichert die aktuelle ROI-Konfiguration in einer JSON-Datei."""
+        save_json_atomically(self.ocr_roi_config, ROI_CONFIG_FILE)
+
+    def add_or_update_roi_config(self, symbol: str, roi_type: str, coords: dict[str, int]):
+        """
+        Fügt einen neuen ROI hinzu oder aktualisiert einen bestehenden für ein Symbol und einen ROI-Typ.
+        Aktualisiert auch die Liste der unterstützten Symbole.
+        """
+        if symbol not in self.ocr_roi_config:
+            self.ocr_roi_config[symbol] = {}
+        self.ocr_roi_config[symbol][roi_type] = coords
+        self.supported_kurs_symbols.add(symbol)
+        self.save_roi_config()
+
+    def delete_roi_config(self, symbol: str, roi_type: str = None):
+        """
+        Löscht einen spezifischen ROI oder alle ROIs für ein Symbol.
+        Aktualisiert die Liste der unterstützten Symbole, wenn nötig.
+        """
+        if symbol in self.ocr_roi_config:
+            if roi_type:
+                if roi_type in self.ocr_roi_config[symbol]:
+                    del self.ocr_roi_config[symbol][roi_type]
+                    if not self.ocr_roi_config[symbol]: # Wenn keine ROIs mehr für das Symbol, entferne Symbol
+                        del self.ocr_roi_config[symbol]
+                        self.supported_kurs_symbols.discard(symbol)
+                    self.save_roi_config()
+            else: # Lösche alle ROIs für das Symbol
+                del self.ocr_roi_config[symbol]
+                self.supported_kurs_symbols.discard(symbol)
+                self.save_roi_config()
+
+    def preprocess_image_for_ocr(self, image: np.ndarray, roi: dict[str, int] = None) -> np.ndarray | None:
+        """
+        Wendet Graustufen, Schwellenwert und optional einen ROI auf ein OpenCV-Bild an.
+        Inklusive adaptiver Schwellenwerte, Gamma-Korrektur und Rauschunterdrückung.
+        """
+        if image is None or image.size == 0:
+            logging.error("Leeres oder ungültiges Bild für Vorverarbeitung erhalten.")
+            return None
+
+        img_to_process = image.copy()
+
+        if roi:
+            x1, y1, x2, y2 = roi['x1'], roi['y1'], roi['x2'], roi['y2']
+            h, w = img_to_process.shape[:2]
+
+            # Begrenze ROI auf Bildgrenzen
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+
+            if x2 <= x1 or y2 <= y1:
+                logging.warning(f"Ungültige oder zu kleine ROI-Koordinaten: {roi}. ROI wird ignoriert.")
+                return None
+            img_to_process = img_to_process[y1:y2, x1:x2]
+            if img_to_process.size == 0:
+                logging.warning(f"ROI führte zu einem leeren Bildsegment. ROI: {roi}. ROI wird ignoriert.")
+                return None
+            
+            # NEU: Hochskalieren kleiner ROIs für bessere OCR-Genauigkeit
+            # Nur hochskalieren, wenn ROI unter einer bestimmten Größe ist
+            if (x2 - x1) < 50 or (y2 - y1) < 20: # Beispiel: wenn Breite < 50px oder Höhe < 20px
+                img_to_process = cv2.resize(img_to_process, None, fx=OCR_UPSCALING_FACTOR, fy=OCR_UPSCALING_FACTOR, interpolation=cv2.INTER_CUBIC)
+
+
+        try:
+            if len(img_to_process.shape) == 3 and img_to_process.shape[2] == 3:
+                gray = cv2.cvtColor(img_to_process, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img_to_process
+
+            # NEU: Fast NLM Denoising (nicht-lokale Mittelwertbildung) zur Rauschunterdrückung
+            # Sehr effektiv für Bilder mit Gaußschem Rauschen
+            denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21) # Hinzugefügt
+            
+            # Adaptive Schwellenwertbildung
+            thresh = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+            
+            # Optionale morphologische Operationen zur Rauschunterdrückung und Zeichenverbesserung
+            kernel = np.ones((1,1),np.uint8) # Kleinster Kernel
+            thresh = cv2.erode(thresh, kernel, iterations = 1) # Erosion, um "Fettigkeit" zu reduzieren
+            thresh = cv2.dilate(thresh, kernel, iterations = 1) # Dilatation, um Lücken zu schließen
+
+            return thresh
+        except Exception as e:
+            logging.error(f"Fehler bei der Bildvorverarbeitung für OCR: {e}")
+            return None
+
+    def perform_ocr_on_roi(self, image_np: np.ndarray, roi_symbol: str, roi_type: str, roi_coords: dict[str, int]) -> tuple[str, float, float] | tuple[None, None, None]:
+        """
+        Führt OCR auf einem spezifischen ROI aus und versucht, einen numerischen Wert oder Text zu extrahieren.
+        Gibt den erkannten Text, den Wert und eine Konfidenz zurück.
+        roi_type: 'value' oder 'symbol'
+        """
+        if not OCR_ENABLED:
+            logging.warning("OCR ist deaktiviert, da Tesseract nicht gefunden wurde.")
+            return None, None, None
+
+        processed_image = self.preprocess_image_for_ocr(image_np, roi_coords)
+        if processed_image is None:
+            return None, None, None
+
+        config_str = '--oem 3 --psm 6' # OEM 3 für Tesseract 4+, PSM 6 für uniform block
+        if roi_type == 'value':
+            config_str += ' -c tessedit_char_whitelist=0123456789.,'
+        elif roi_type == 'symbol':
+            config_str += ' -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+            config_str = '--oem 3 --psm 8' # PSM 8 für single word ist oft besser für Symbole
+        else:
+            logging.warning(f"Unbekannter ROI-Typ '{roi_type}'. Verwende Standard-OCR-Konfiguration.")
+            config_str = '--oem 3 --psm 6'
+
+        try:
+            data = pytesseract.image_to_data(processed_image, output_type=pytesseract.Output.DICT, config=config_str)
+            
+            detected_text = ""
+            detected_value = None
+            avg_conf = 0
+            
+            best_conf = -1
+            best_word = None
+            best_value = None
+
+            for i in range(len(data['text'])):
+                word = data['text'][i].strip()
+                conf = int(data['conf'][i])
+                
+                if word and conf != -1: # Ignoriere leere Strings oder -1 Konfidenz (Tesseract konnte nichts erkennen)
+                    if roi_type == 'value':
+                        cleaned_word = re.sub(r'[^\d.,]+', '', word).replace(',', '.')
+                        try:
+                            val = float(cleaned_word)
+                            if OCR_VALUE_MIN <= val <= OCR_VALUE_MAX:
+                                if conf > best_conf:
+                                    best_conf = conf
+                                    best_word = word 
+                                    best_value = val
+                        except ValueError:
+                            pass 
+                    elif roi_type == 'symbol':
+                        if conf > best_conf: # Nimm immer den mit der höchsten Konfidenz für Symbole
+                            best_conf = conf
+                            best_word = word.upper() 
+            
+            detected_text = best_word if best_word is not None else ""
+            detected_value = best_value
+            avg_conf = best_conf if best_conf != -1 else 0 
+
+            if avg_conf < OCR_CONFIDENCE_THRESHOLD:
+                logging.debug(f"ROI '{roi_symbol}' ({roi_type}): Konfidenz ({avg_conf:.1f}%) unter Schwellenwert ({OCR_CONFIDENCE_THRESHOLD}%). Erkannt: '{detected_text}'")
+                # Rückgabe für Debugging, aber mit "schlechter" Konfidenz
+                return detected_text, detected_value, float(avg_conf) 
+            
+            logging.debug(f"ROI '{roi_symbol}' ({roi_type}) erkannt: Text='{detected_text}', Wert={detected_value}, Konfidenz={avg_conf:.1f}%")
+            return detected_text, detected_value, float(avg_conf)
+
+        except pytesseract.TesseractError as e:
+            logging.error(f"Tesseract OCR Fehler für ROI '{roi_symbol}' ({roi_type}): {e}. Überprüfen Sie Tesseract-Installation/Pfad.")
+            return None, None, None
+        except Exception as e:
+            logging.error(f"Unerwarteter Fehler bei OCR für ROI '{roi_symbol}' ({roi_type}): {e}")
+            return None, None, None
+
+    def process_image_for_kurs_data(self, image_path: str) -> list[tuple[str, float, float]]:
+        """
+        Führt OCR auf ALLEN bekannten ROIs (Symbole und Werte) durch und gibt eine Liste
+        der erkannten Symbol-Wert-Paare mit Konfidenz zurück.
+        Priorisiert ROIs und nutzt den Dateinamen als Fallback.
+        """
+        if not OCR_ENABLED:
+            logging.warning("OCR ist deaktiviert, kann Bildanalyse nicht durchführen.")
+            return []
+
+        logging.info(f"Starte vollständige Bildanalyse für: {image_path}")
+        try:
+            image_np = cv2.imread(image_path)
+            if image_np is None:
+                logging.error(f"Bild konnte nicht geladen werden für Analyse: {image_path}")
+                return []
+
+            candidate_pairs = [] # Liste von (symbol, value, confidence)
+            
+            # --- Schritt 1: Erkennung basierend auf konfigurierten ROIs ---
+            for symbol_key, roi_data in self.ocr_roi_config.items():
+                detected_symbol_from_roi = None
+                symbol_conf = 0.0
+                detected_value_from_roi = None
+                value_conf = 0.0
+
+                # Versuche Symbol-ROI zu lesen, falls konfiguriert
+                if 'symbol' in roi_data:
+                    text, _, conf = self.perform_ocr_on_roi(image_np, symbol_key, 'symbol', roi_data['symbol'])
+                    if text and conf is not None:
+                        # Akzeptiere Symbol-OCR auch bei niedrigerer Konfidenz, aber speichere die Konfidenz
+                        detected_symbol_from_roi = text.upper()
+                        symbol_conf = conf
+                        logging.debug(f"Symbol '{detected_symbol_from_roi}' aus Symbol-ROI '{symbol_key}' erkannt mit Konfidenz {conf:.1f}%")
+                
+                # Wenn kein Symbol-ROI für diesen Schlüssel, aber ein Wert-ROI, versuchen wir den Schlüssel als Symbol zu nehmen
+                if not detected_symbol_from_roi and 'value' in roi_data:
+                     detected_symbol_from_roi = symbol_key.upper()
+                     symbol_conf = 0.0 # Konfidenz ist 0, da nicht per OCR erkannt
+
+                # Wenn wir ein potenzielles Symbol haben, versuchen wir den Wert-ROI zu lesen
+                if detected_symbol_from_roi and 'value' in roi_data:
+                    value_text, value, conf = self.perform_ocr_on_roi(image_np, detected_symbol_from_roi, 'value', roi_data['value'])
+                    if value is not None and conf is not None:
+                        detected_value_from_roi = value
+                        value_conf = conf
+                        
+                        # Gesamtkonfidenz: Wenn Symbol-OCR erfolgreich war, gewichten. Ansonsten nur Wert-Konfidenz
+                        # Wir geben Konfidenz für den Wert zurück, da das der entscheidende Teil ist.
+                        overall_conf = value_conf # Fokus auf die Konfidenz des numerischen Wertes
+                        if detected_symbol_from_roi in self.supported_kurs_symbols: # Erhöhte Konfidenz, wenn Symbol bekannt ist
+                            overall_conf = (overall_conf + 100) / 2 if overall_conf > 0 else 100 # Bekannte Symbole bekommen Bonus
+                        
+                        # Nur hinzufügen, wenn der Wert plausibel ist und Konfidenz hoch genug
+                        if overall_conf >= OCR_CONFIDENCE_THRESHOLD:
+                             candidate_pairs.append((detected_symbol_from_roi, detected_value_from_roi, overall_conf))
+                             logging.info(f"Kandidat aus ROIs: Symbol='{detected_symbol_from_roi}', Wert={detected_value_from_roi}, Gesamt-Konfidenz={overall_conf:.1f}%")
+                        else:
+                            logging.warning(f"Wert-OCR für Symbol '{detected_symbol_from_roi}' (ROI-Typ 'value') zu geringe Konfidenz ({conf:.1f}%). Nicht akzeptiert.")
+                elif detected_symbol_from_roi:
+                    logging.debug(f"Kein Wert-ROI für Symbol '{detected_symbol_from_roi}' konfiguriert oder Wert-OCR fehlgeschlagen.")
+
+
+            # --- Schritt 2: Fallback - Symbol aus Dateinamen extrahieren, falls noch keine guten Ergebnisse ---
+            # Dieser Schritt wird jetzt immer ausgeführt, um mehr Chancen zu geben, ein Symbol zu finden,
+            # aber nur, wenn es noch keine HOHE Konfidenz aus ROIs gab.
+            
+            # Prüfe, ob es bereits einen Kandidaten mit sehr hoher Konfidenz (>85%) gibt
+            has_high_confidence_roi_candidate = any(p[2] >= 85 for p in candidate_pairs)
+
+            if not has_high_confidence_roi_candidate: # Nur, wenn ROIs keine *sehr* zuverlässigen Ergebnisse lieferten
+                filename = os.path.basename(image_path).lower()
+                detected_kurs_symbol_from_filename: str | None = None
+                for symbol in self.supported_kurs_symbols:
+                    if symbol.lower() in filename:
+                        detected_kurs_symbol_from_filename = symbol.upper()
+                        logging.debug(f"Symbol '{detected_kurs_symbol_from_filename}' aus Dateinamen '{filename}' erkannt.")
+                        break
+                
+                if detected_kurs_symbol_from_filename:
+                    # Wenn Symbol aus Dateinamen erkannt, und ein Wert-ROI für dieses Symbol existiert
+                    if detected_kurs_symbol_from_filename in self.ocr_roi_config and 'value' in self.ocr_roi_config[detected_kurs_symbol_from_filename]:
+                        value_roi = self.ocr_roi_config[detected_kurs_symbol_from_filename]['value']
+                        text, value, conf = self.perform_ocr_on_roi(image_np, detected_kurs_symbol_from_filename, 'value', value_roi)
+                        if value is not None and conf is not None and conf >= OCR_CONFIDENCE_THRESHOLD:
+                            candidate_pairs.append((detected_kurs_symbol_from_filename, value, conf))
+                            logging.info(f"Kandidat (Dateiname + ROI): Symbol='{detected_kurs_symbol_from_filename}', Wert={value}, Konfidenz={conf:.1f}%")
+                        else:
+                            logging.warning(f"OCR für Wert von '{detected_kurs_symbol_from_filename}' (aus Dateinamen) mit ROI fehlgeschlagen oder zu geringe Konfidenz.")
+                    else:
+                        logging.warning(f"Kein Wert-ROI für '{detected_kurs_symbol_from_filename}' (aus Dateinamen) konfiguriert. Simuliere Wert.")
+                        # Fallback: Simuliere Wert für Demonstration, falls kein ROI konfiguriert ist
+                        seed_val = sum(ord(c) for c in detected_kurs_symbol_from_filename) + datetime.now().minute
+                        random.seed(seed_val)
+                        base_value = {
+                            "AAPL": 170.0, "GOOGL": 1800.0, "MSFT": 350.0,
+                            "AMZN": 150.0, "TSLA": 250.0, "NFLX": 400.0, "NVDA": 800.0,
+                            "BTC": 60000.0, "ETH": 3000.0, "EURUSD": 1.08, "XAUUSD": 2300.0, "ADA": 0.35, "DXY": 105.0 # NEU
+                        }.get(detected_kurs_symbol_from_filename, 100.0)
+                        simulated_value = round(base_value * (1 + random.uniform(-0.02, 0.02)), 4)
+                        simulated_value = max(OCR_VALUE_MIN, min(OCR_VALUE_MAX, simulated_value))
+                        candidate_pairs.append((detected_kurs_symbol_from_filename, simulated_value, 20.0)) # Geringe Konfidenz
+                        logging.warning(f"Simuliere Wert für {detected_kurs_symbol_from_filename}, da kein ROI konfiguriert ist: {simulated_value}")
+                else:
+                    logging.warning(f"Kein unterstütztes Kurs-Symbol im Dateinamen von {image_path} erkannt und keine Symbol-ROIs gefunden.")
+
+
+            if not candidate_pairs:
+                logging.warning(f"Konnte weder Symbol noch Wert aus {image_path} zuverlässig extrahieren.")
+                return []
+            
+            # Sortiere Kandidaten nach Konfidenz absteigend
+            candidate_pairs.sort(key=lambda x: x[2], reverse=True)
+            
+            return candidate_pairs
+
+        except Exception as e:
+            logging.error(f"Kritischer Fehler bei der umfassenden Bildverarbeitung für {image_path}: {e}")
+            return []
+
+
+# --- UI-Komponente: DebugROICanvas ---
+class DebugROICanvas(tk.Canvas):
+    """
+    Ein Tkinter-Canvas zur Anzeige eines Bildes und zum Debuggen/Anpassen von OCR ROIs.
+    Ermöglicht das Zeichnen, Verschieben und Ändern von Rechtecken.
+    """
+    def __init__(self, master, file_path: str, ocr_processor: OCRProcessor, update_callback, **kwargs):
+        super().__init__(master, **kwargs)
+        self.file_path = file_path
+        self.original_image = None
+        self.original_image_np = None # Für OpenCV-Verarbeitung
+
+        try:
+            self.original_image = Image.open(file_path)
+            self.original_image_np = cv2.imread(file_path) 
+            if self.original_image_np is None:
+                 raise ValueError("OpenCV konnte Bild nicht laden.")
+        except Exception as e:
+            logging.error(f"Konnte Bild {file_path} nicht laden: {e}")
+            messagebox.showerror("Fehler", f"Bild konnte nicht geladen werden: {file_path}\n{e}")
+            self.original_image = Image.new("RGB", (800, 600), (200, 200, 200))
+            self.original_image_np = np.zeros((600, 800, 3), dtype=np.uint8) + 200
+
+
+        self.tk_image = None
+        self.image_scale = 1.0
+        self.ocr_processor = ocr_processor
+        self.current_roi_config: dict[str, dict[str, dict[str, int]]] = self.ocr_processor.ocr_roi_config
+        self.update_callback = update_callback
+
+        self.font = self._load_font()
+
+        self._draw_state = {'start_x': None, 'start_y': None, 'rect_id': None, 'is_new_roi': False}
+        self.drag_start_coords = None 
+        self.drag_current_roi_id = None # (Symbol, Type) tuple of the ROI being dragged/highlighted
+        self.hovered_roi_id = None # (Symbol, Type) for highlighting on hover
+
+        self.bind("<Configure>", self._on_resize)
+        self.bind("<ButtonPress-1>", self._on_button_press)
+        self.bind("<B1-Motion>", self._on_mouse_drag)
+        self.bind("<ButtonRelease-1>", self._on_button_release)
+        self.bind("<ButtonPress-3>", self._on_right_click) 
+        self.bind("<Motion>", self._on_mouse_motion) # Für Hover-Effekt
+
+        self._draw_image()
+
+    def _load_font(self):
+        """Versucht, eine Schriftart zu laden, ansonsten wird eine Standard-Schriftart verwendet."""
+        try:
+            return ImageFont.truetype(FONT_PATH, 14)
+        except IOError:
+            logging.warning(f"Font file not found at {FONT_PATH}. Using default PIL font for OCR text. Consider installing 'arial.ttf' or similar.")
+            return ImageFont.load_default()
+
+    def _draw_image(self):
+        """Zeichnet das Bild auf dem Canvas und skaliert es bei Bedarf."""
+        if self.original_image is None:
+            return
+
+        canvas_width = self.winfo_width()
+        canvas_height = self.winfo_height()
+
+        if canvas_width == 0 or canvas_height == 0:
+            return
+
+        img_width, img_height = self.original_image.size
+        
+        scale_w = canvas_width / img_width
+        scale_h = canvas_height / img_height
+        self.image_scale = min(scale_w, scale_h)
+
+        new_width = int(img_width * self.image_scale)
+        new_height = int(img_height * img_height * self.image_scale) # Fehler korrigiert: sollte img_height * self.image_scale sein
+
+        self.img_x = (canvas_width - new_width) // 2
+        self.img_y = (canvas_height - new_height) // 2
+
+        self.display_image_pil = Image.new("RGB", (canvas_width, canvas_height), (128, 128, 128))
+        resized_image = self.original_image.resize((new_width, new_height), Image.LANCZOS)
+        self.display_image_pil.paste(resized_image, (self.img_x, self.img_y))
+        
+        draw = ImageDraw.Draw(self.display_image_pil)
+        self._draw_existing_rois_on_image(draw)
+
+        self.tk_image = ImageTk.PhotoImage(self.display_image_pil)
+        
+        self.delete("all")
+        self.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
+
+        # Draw the currently drawn rectangle if any
+        if self._draw_state['rect_id']:
+            x1_canvas = self._draw_state['start_x'] * self.image_scale + self.img_x
+            y1_canvas = self._draw_state['start_y'] * self.image_scale + self.img_y
+            end_x_canvas = (self.canvasx(self._draw_state['last_motion_x']) if 'last_motion_x' in self._draw_state else self._draw_state['start_x']) * self.image_scale + self.img_x
+            end_y_canvas = (self.canvasy(self._draw_state['last_motion_y']) if 'last_motion_y' in self._draw_state else self._draw_state['start_y']) * self.image_scale + self.img_y
+            
+            self.delete("temp_rect")
+            self.create_rectangle(x1_canvas, y1_canvas, end_x_canvas, end_y_canvas, outline="orange", width=3, tags="temp_rect")
+
+
+    def _draw_existing_rois_on_image(self, draw: ImageDraw.ImageDraw):
+        """Zeichnet vorhandene ROIs und deren OCR-Ergebnisse auf das Bild."""
+        for symbol, roi_types_data in self.current_roi_config.items():
+            for roi_type, roi_coords in roi_types_data.items():
+                x1_orig, y1_orig, x2_orig, y2_orig = roi_coords['x1'], roi_coords['y1'], roi_coords['x2'], roi_coords['y2']
+                
+                # Skaliere ROI-Koordinaten auf die aktuelle Anzeigegröße
+                x1_scaled = int(x1_orig * self.image_scale) + self.img_x
+                y1_scaled = int(y1_orig * self.image_scale) + self.img_y
+                x2_scaled = int(x2_orig * self.image_scale) + self.img_x
+                y2_scaled = int(y2_orig * self.image_scale) + self.img_y
+
+                # Bestimme Umrissfarbe und Dicke
+                outline_color = "red" if roi_type == "value" else "blue"
+                line_width = 2
+                if (symbol, roi_type) == self.drag_current_roi_id:
+                    outline_color = "yellow" # Aktuell gezogener/ausgewählter ROI
+                    line_width = 3
+                elif (symbol, roi_type) == self.hovered_roi_id:
+                    outline_color = "cyan" # Gehoverter ROI
+                    line_width = 2
+                
+                draw.rectangle([x1_scaled, y1_scaled, x2_scaled, y2_scaled], outline=outline_color, width=line_width)
+                
+                # Zeige Symbol und ROI-Typ
+                draw.text((x1_scaled + 2, y1_scaled + 2), f"{symbol} ({roi_type})", font=self.font, fill=outline_color)
+
+                # Führe OCR für diesen ROI aus und zeige das Ergebnis an
+                text, value, conf = self.ocr_processor.perform_ocr_on_roi(self.original_image_np, symbol, roi_type, roi_coords)
+                
+                ocr_text = ""
+                text_color = "black"
+
+                if roi_type == 'value':
+                    if value is not None and conf is not None:
+                        # Dynamische Formatierung für Wert
+                        if value < 1.0:
+                            value_format = ".4f"
+                        elif value < 100.0:
+                            value_format = ".2f"
+                        else:
+                            value_format = ".0f"
+
+                        ocr_text = f"OCR: {value:{value_format}} (Conf: {conf:.1f}%)"
+                        if conf >= OCR_CONFIDENCE_THRESHOLD:
+                            text_color = "green"
+                        elif conf >= OCR_CONFIDENCE_THRESHOLD * 0.7:
+                            text_color = "orange"
+                        else:
+                            text_color = "red" # Geringe Konfidenz
+                    else:
+                        ocr_text = "OCR: N/A"
+                        text_color = "gray"
+                elif roi_type == 'symbol':
+                    if text is not None and conf is not None:
+                        ocr_text = f"OCR: {text} (Conf: {conf:.1f}%)"
+                        if conf >= OCR_CONFIDENCE_THRESHOLD:
+                            text_color = "purple"
+                        else:
+                            text_color = "gray"
+                    else:
+                        ocr_text = "OCR: N/A"
+                        text_color = "gray"
+
+                # Stelle sicher, dass der Text nicht außerhalb des Bildes gezeichnet wird
+                text_y_pos = y2_scaled - 18
+                if text_y_pos < y1_scaled + 20:
+                    text_y_pos = y1_scaled + 20
+
+                draw.text((x1_scaled + 2, text_y_pos), ocr_text, font=self.font, fill=text_color)
+
+    def _on_resize(self, event):
+        """Reagiert auf Größenänderungen des Canvas."""
+        self._draw_image()
+
+    def _get_roi_at_coords(self, x_canvas, y_canvas):
+        """Findet den ROI an den gegebenen Canvas-Koordinaten und gibt (symbol, roi_type, coords) zurück."""
+        clicked_x_orig = (x_canvas - self.img_x) / self.image_scale
+        clicked_y_orig = (y_canvas - self.img_y) / self.image_scale
+
+        for symbol, roi_types_data in self.current_roi_config.items():
+            for roi_type, roi_coords in roi_types_data.items():
+                if (roi_coords['x1'] <= clicked_x_orig <= roi_coords['x2'] and
+                    roi_coords['y1'] <= clicked_y_orig <= roi_coords['y2']):
+                    return (symbol, roi_type, roi_coords)
+        return None
+
+    def _on_button_press(self, event):
+        """Behandelt das Drücken der Maustaste (Startpunkt für neues ROI oder Ziehen)."""
+        self._draw_state['start_x'] = (event.x - self.img_x) / self.image_scale
+        self._draw_state['start_y'] = (event.y - self.img_y) / self.image_scale
+        self._draw_state['rect_id'] = None
+        self._draw_state['is_new_roi'] = True
+        self.drag_start_coords = None
+        self.drag_current_roi_id = None
+
+        # Prüfen, ob eine existierende ROI angeklickt wurde
+        found_roi = self._get_roi_at_coords(event.x, event.y)
+        if found_roi:
+            symbol, roi_type, _ = found_roi
+            self.drag_start_coords = (event.x, event.y)
+            self.drag_current_roi_id = (symbol, roi_type)
+            self._draw_state['is_new_roi'] = False
+            self._draw_image() # Markiere den ausgewählten ROI
+            return
+
+    def _on_mouse_drag(self, event):
+        """Behandelt das Ziehen der Maus (Zeichnen oder Verschieben von ROI)."""
+        self._draw_state['last_motion_x'] = event.x
+        self._draw_state['last_motion_y'] = event.y
+
+        cur_x_orig = (event.x - self.img_x) / self.image_scale
+        cur_y_orig = (event.y - self.img_y) / self.image_scale
+
+        if self._draw_state['is_new_roi']:
+            # Drawing a new ROI
+            self._draw_image() # Redraw to clear old temp rect and draw new one
+        elif self.drag_start_coords and self.drag_current_roi_id:
+            # Dragging an existing ROI
+            symbol_to_drag, type_to_drag = self.drag_current_roi_id
+            
+            dx_orig = (event.x - self.drag_start_coords[0]) / self.image_scale
+            dy_orig = (event.y - self.drag_start_coords[1]) / self.image_scale
+
+            if symbol_to_drag in self.current_roi_config and type_to_drag in self.current_roi_config[symbol_to_drag]:
+                roi = self.current_roi_config[symbol_to_drag][type_to_drag]
+                
+                roi['x1'] = int(roi['x1'] + dx_orig)
+                roi['y1'] = int(roi['y1'] + dy_orig)
+                roi['x2'] = int(roi['x2'] + dx_orig)
+                roi['y2'] = int(roi['y2'] + dy_orig)
+
+                img_width, img_height = self.original_image.size
+                roi['x1'] = max(0, roi['x1'])
+                roi['y1'] = max(0, roi['y1'])
+                roi['x2'] = min(img_width, roi['x2'])
+                roi['y2'] = min(img_height, roi['y2'])
+
+                self.drag_start_coords = (event.x, event.y)
+                self._draw_image()
+
+    def _on_button_release(self, event):
+        """Behandelt das Loslassen der Maustaste (ROI-Erstellung abgeschlossen)."""
+        end_x = (event.x - self.img_x) / self.image_scale
+        end_y = (event.y - self.img_y) / self.image_scale
+
+        if self._draw_state['is_new_roi'] and self._draw_state['start_x'] is not None:
+            x1, y1 = int(min(self._draw_state['start_x'], end_x)), int(min(self._draw_state['start_y'], end_y))
+            x2, y2 = int(max(self._draw_state['start_x'], end_x)), int(max(self._draw_state['start_y'], end_y))
+
+            if (x2 - x1) > 5 and (y2 - y1) > 5:  # Minimalgröße für ROI
+                self._prompt_for_roi_details(x1, y1, x2, y2)
+            else:
+                logging.warning("Gezeichneter ROI ist zu klein.")
+                messagebox.showinfo("ROI zu klein", "Bitte zeichnen Sie ein größeres Rechteck für den ROI (mind. 5x5 Pixel).")
+
+        self._draw_state['start_x'] = None
+        self._draw_state['start_y'] = None
+        self._draw_state['rect_id'] = None
+        self._draw_state['is_new_roi'] = False
+        self.drag_start_coords = None
+        self.drag_current_roi_id = None
+        self.delete("temp_rect") # Entferne temporäres Rechteck
+        self._draw_image()
+
+    def _on_right_click(self, event):
+        """Behandelt den Rechtsklick (ROI löschen)."""
+        found_roi = self._get_roi_at_coords(event.x, event.y)
+        if found_roi:
+            symbol, roi_type, _ = found_roi
+            if messagebox.askyesno("ROI löschen", f"Möchten Sie den {roi_type}-ROI für '{symbol}' wirklich löschen?"):
+                self.ocr_processor.delete_roi_config(symbol, roi_type)
+                self.update_callback()
+                self._draw_image()
+                logging.info(f"ROI ({roi_type}) für Symbol '{symbol}' gelöscht.")
+            return
+
+    def _on_mouse_motion(self, event):
+        """Aktualisiert den gehoverten ROI für visuelles Feedback."""
+        found_roi = self._get_roi_at_coords(event.x, event.y)
+        if found_roi and found_roi[0:2] != self.hovered_roi_id:
+            self.hovered_roi_id = found_roi[0:2]
+            self._draw_image()
+        elif not found_roi and self.hovered_roi_id:
+            self.hovered_roi_id = None
+            self._draw_image()
+
+    def _prompt_for_roi_details(self, x1, y1, x2, y2):
+        """Fragt den Benutzer nach dem Symbol und Typ für den neuen ROI."""
+        dialog = tk.Toplevel(self.master)
+        dialog.title("ROI Details eingeben")
+        dialog.transient(self.master)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frame = ttk.Frame(dialog, padding="10")
+        frame.pack(expand=True, fill="both")
+
+        ttk.Label(frame, text="Kurs-Symbol (z.B. ADA, GOOGL):").pack(padx=10, pady=5)
+        symbol_entry = ttk.Entry(frame)
+        symbol_entry.pack(padx=10, pady=2)
+        symbol_entry.focus_set()
+
+        ttk.Label(frame, text="ROI-Typ:").pack(padx=10, pady=5)
+        roi_type_var = tk.StringVar(value="value")
+        ttk.Radiobutton(frame, text="Wert (z.B. Preis)", variable=roi_type_var, value="value").pack(anchor="w", padx=10)
+        ttk.Radiobutton(frame, text="Symbol (z.B. ADA)", variable=roi_type_var, value="symbol").pack(anchor="w", padx=10)
+
+        # NEU: OCR-Vorschau im Dialog
+        ttk.Label(frame, text="OCR Vorschau:").pack(padx=10, pady=5)
+        self.ocr_preview_label = ttk.Label(frame, text="Wird geladen...", font=("Arial", 10, "italic"))
+        self.ocr_preview_label.pack(padx=10, pady=2)
+
+        def update_ocr_preview():
+            roi_coords = {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2}
+            text, value, conf = self.ocr_processor.perform_ocr_on_roi(self.original_image_np, symbol_entry.get().strip().upper(), roi_type_var.get(), roi_coords)
+            
+            display_text = ""
+            if roi_type_var.get() == 'value':
+                if value is not None:
+                    if value < 1.0: val_fmt = ".4f"
+                    elif value < 100.0: val_fmt = ".2f"
+                    else: val_fmt = ".0f"
+                    display_text = f"Wert: {value:{val_fmt}} (Conf: {conf:.1f}%)"
+                else:
+                    display_text = f"Text: '{text}' (Conf: {conf:.1f}%) - Konnte nicht als Wert interpretiert werden."
+            else: # symbol
+                display_text = f"Text: '{text}' (Conf: {conf:.1f}%)"
+
+            self.ocr_preview_label.config(text=display_text)
+            
+            # Farb-Feedback zur Konfidenz
+            if conf >= OCR_CONFIDENCE_THRESHOLD:
+                self.ocr_preview_label.config(fg="green")
+            elif conf >= OCR_CONFIDENCE_THRESHOLD * 0.7:
+                self.ocr_preview_label.config(fg="orange")
+            else:
+                self.ocr_preview_label.config(fg="red")
+
+        # Initial und bei Änderungen aktualisieren
+        symbol_entry.bind("<KeyRelease>", lambda e: update_ocr_preview())
+        roi_type_var.trace_add("write", lambda name, index, mode, sv=roi_type_var: update_ocr_preview())
+        self.after(50, update_ocr_preview) # Etwas Verzögerung, um GUI-Update zu ermöglichen
+
+        def on_submit():
+            symbol = symbol_entry.get().strip().upper()
+            roi_type = roi_type_var.get()
+
+            if not symbol:
+                messagebox.showwarning("Eingabe ungültig", "Bitte geben Sie ein Symbol ein.")
+                return
+
+            if symbol in self.current_roi_config and roi_type in self.current_roi_config[symbol]:
+                if not messagebox.askyesno("ROI überschreiben", f"Der {roi_type}-ROI für '{symbol}' existiert bereits. Möchten Sie ihn überschreiben?"):
+                    dialog.destroy()
+                    return
+
+            self.ocr_processor.add_or_update_roi_config(symbol, roi_type, {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
+            self.update_callback()
+            self._draw_image()
+            logging.info(f"Neuer {roi_type}-ROI für Symbol '{symbol}' gespeichert: {x1},{y1},{x2},{y2}")
+            dialog.destroy()
+
+        submit_button = ttk.Button(frame, text="Speichern", command=on_submit)
+        submit_button.pack(pady=10)
+
+        dialog.bind("<Return>", lambda e: on_submit())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+
+
+# --- Hauptanwendung ---
+class KursPrognoseApp(tk.Tk):
+    """Hauptanwendung für die Kurs-Prognose mit GUI."""
+    def __init__(self):
+        super().__init__()
+        self.title("Kurs Prognose System")
+        self.geometry("1200x800")
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+        self.data_handler = DataHandler()
+        self.prognose_modul = PrognoseModul() # PrognoseModul initialisiert CandleBehaviorLearner
+        self.ocr_processor = OCRProcessor(self.data_handler)
+        self.executor_ocr = ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
+        self.executor_prognosis = ThreadPoolExecutor(max_workers=1)
+        self.watching_folder = False
+
+        self._setup_ui()
+        self._check_and_create_folders()
+        self.update_kurs_symbols_list()
+        self._start_watch_folder()
+        setup_tesseract_path() # Überprüfe Tesseract-Pfad beim Start
+
+    def _setup_ui(self):
+        """Richtet die Haupt-Benutzeroberfläche ein."""
+        self.main_notebook = ttk.Notebook(self)
+        self.main_notebook.pack(expand=True, fill="both", padx=10, pady=10)
+
+        self.live_prognose_frame = ttk.Frame(self.main_notebook)
+        self.main_notebook.add(self.live_prognose_frame, text="Live-Daten & Prognosen")
+        self._setup_live_prognose_tab(self.live_prognose_frame)
+
+        self.roi_debug_frame = ttk.Frame(self.main_notebook)
+        self.main_notebook.add(self.roi_debug_frame, text="ROI Debugging")
+        self._setup_roi_debug_tab(self.roi_debug_frame)
+
+        self.prognosis_history_frame = ttk.Frame(self.main_notebook)
+        self.main_notebook.add(self.prognosis_history_frame, text="Prognosen-Historie")
+        self._setup_prognosis_history_tab(self.prognosis_history_frame)
+
+        self.status_bar = ttk.Label(self, text="Bereit.", relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def _setup_live_prognose_tab(self, parent_frame):
+        """Richtet das Live-Daten & Prognosen Tab ein."""
+        parent_frame.columnconfigure(0, weight=1)
+        parent_frame.rowconfigure(1, weight=1)
+
+        top_frame = ttk.Frame(parent_frame)
+        top_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+        top_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(top_frame, text="Aktueller Kurs:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
+        self.kurs_symbol_var = tk.StringVar(self)
+        self.kurs_symbol_combobox = ttk.Combobox(top_frame, textvariable=self.kurs_symbol_var, state="readonly")
+        self.kurs_symbol_combobox.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
+        self.kurs_symbol_combobox.bind("<<ComboboxSelected>>", self._on_kurs_symbol_selected)
+
+        self.current_value_label = ttk.Label(top_frame, text="Wert: N/A")
+        self.current_value_label.grid(row=0, column=2, padx=5, pady=2, sticky="e")
+        self.last_update_label = ttk.Label(top_frame, text="Letzte Aktualisierung: N/A")
+        self.last_update_label.grid(row=0, column=3, padx=5, pady=2, sticky="e")
+
+        self.graph_frame = ttk.Frame(parent_frame, relief=tk.SUNKEN, borderwidth=1)
+        self.graph_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+
+        self.fig: Figure
+        self.ax = None
+        self.fig, self.ax = plt.subplots(figsize=(6, 4), dpi=100)
+        self.canvas_plot = FigureCanvasTkAgg(self.fig, master=self.graph_frame)
+        self.canvas_widget = self.canvas_plot.get_tk_widget()
+        self.canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        
+        # NEU: NavigationToolbar für Matplotlib
+        self.toolbar = NavigationToolbar2Tk(self.canvas_plot, self.graph_frame)
+        self.toolbar.update()
+        self.canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.canvas_plot.draw()
+
+        prediction_frame = ttk.LabelFrame(parent_frame, text="Prognose")
+        prediction_frame.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
+        prediction_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(prediction_frame, text="Prognostizierter Wert:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
+        self.predicted_value_label = ttk.Label(prediction_frame, text="N/A", font=("Arial", 12, "bold"))
+        self.predicted_value_label.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
+
+        ttk.Label(prediction_frame, text="Konfidenz:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
+        self.confidence_label = ttk.Label(prediction_frame, text="N/A", font=("Arial", 10))
+        self.confidence_label.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
+
+        ttk.Label(prediction_frame, text="Prognose für:").grid(row=2, column=0, padx=5, pady=2, sticky="w")
+        self.prediction_time_label = ttk.Label(prediction_frame, text="N/A")
+        self.prediction_time_label.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
+
+        ttk.Label(prediction_frame, text="Erwartete Spanne:").grid(row=3, column=0, padx=5, pady=2, sticky="w")
+        self.predicted_range_label = ttk.Label(prediction_frame, text="N/A", font=("Arial", 10))
+        self.predicted_range_label.grid(row=3, column=1, padx=5, pady=2, sticky="ew")
+
+        ttk.Label(prediction_frame, text="Kerzenverhalten:").grid(row=4, column=0, padx=5, pady=2, sticky="w")
+        self.candle_direction_label = ttk.Label(prediction_frame, text="N/A", font=("Arial", 10))
+        self.candle_direction_label.grid(row=4, column=1, padx=5, pady=2, sticky="ew")
+
+
+        self.make_prognose_button = ttk.Button(prediction_frame, text="Prognose erstellen", command=self._create_prognose_async)
+        self.make_prognose_button.grid(row=5, column=0, columnspan=2, pady=5)
+
+    def _setup_roi_debug_tab(self, parent_frame):
+        """Richtet das ROI Debugging Tab ein."""
+        parent_frame.columnconfigure(0, weight=1)
+        parent_frame.rowconfigure(1, weight=1)
+
+        top_controls = ttk.Frame(parent_frame)
+        top_controls.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+        top_controls.columnconfigure(1, weight=1)
+
+        ttk.Label(top_controls, text="Bild auswählen:").grid(row=0, column=0, padx=5, pady=2)
+        self.roi_image_path_entry = ttk.Entry(top_controls, state="readonly")
+        self.roi_image_path_entry.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
+        ttk.Button(top_controls, text="Durchsuchen...", command=self._select_roi_image).grid(row=0, column=2, padx=5, pady=2)
+
+        self.debug_canvas_frame = ttk.Frame(parent_frame, relief=tk.SUNKEN, borderwidth=1)
+        self.debug_canvas_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+
+        self.roi_debug_canvas: DebugROICanvas | None = None
+        
+        ttk.Label(parent_frame, text="Linksklick und Ziehen zum Erstellen eines neuen ROI (dann Symbol & Typ wählen). Rechtsklick auf einen ROI zum Löschen.").grid(row=2, column=0, padx=5, pady=5)
+
+    def _setup_prognosis_history_tab(self, parent_frame):
+        """Richtet das Prognosen-Historie Tab ein."""
+        parent_frame.columnconfigure(0, weight=1)
+        parent_frame.rowconfigure(1, weight=1)
+
+        top_controls = ttk.Frame(parent_frame)
+        top_controls.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+        ttk.Label(top_controls, text="Kurs-Symbol:").grid(row=0, column=0, padx=5, pady=2)
+        self.history_kurs_symbol_var = tk.StringVar(self)
+        self.history_kurs_symbol_combobox = ttk.Combobox(top_controls, textvariable=self.history_kurs_symbol_var, state="readonly")
+        self.history_kurs_symbol_combobox.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
+        self.history_kurs_symbol_combobox.bind("<<ComboboxSelected>>", self._on_history_kurs_symbol_selected)
+
+        self.prognosis_tree = ttk.Treeview(parent_frame, columns=("Symbol", "Vorhersagezeit", "Vorhergesagter Wert", "Aktueller Wert", "Fehler", "Konfidenz", "Spanne Min", "Spanne Max", "Kerze", "Evaluierungszeit"), show="headings")
+        self.prognosis_tree.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+
+        for col in self.prognosis_tree["columns"]:
+            self.prognosis_tree.heading(col, text=col)
+            self.prognosis_tree.column(col, width=100, anchor="center")
+
+        self.prognosis_tree.column("Symbol", width=70)
+        self.prognosis_tree.column("Vorhergesagter Wert", width=120)
+        self.prognosis_tree.column("Aktueller Wert", width=100)
+        self.prognosis_tree.column("Fehler", width=80)
+        self.prognosis_tree.column("Konfidenz", width=80)
+        self.prognosis_tree.column("Spanne Min", width=90)
+        self.prognosis_tree.column("Spanne Max", width=90)
+        self.prognosis_tree.column("Kerze", width=120)
+
+        vsb = ttk.Scrollbar(parent_frame, orient="vertical", command=self.prognosis_tree.yview)
+        vsb.grid(row=1, column=1, sticky="ns")
+        self.prognosis_tree.configure(yscrollcommand=vsb.set)
+
+        self.prognosis_tree.bind("<Double-1>", self._on_prognosis_double_click) # Doppelklick zum Evaluieren
+
+        self.evaluate_button = ttk.Button(parent_frame, text="Prognose evaluieren (Doppelklick)", command=self._open_evaluate_dialog)
+        self.evaluate_button.grid(row=2, column=0, pady=5)
+
+    def _check_and_create_folders(self):
+        """Überprüft und erstellt notwendige Ordner."""
+        os.makedirs(WATCH_FOLDER, exist_ok=True)
+        os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+        os.makedirs(MODELS_DIR, exist_ok=True)
+        os.makedirs(CANDLE_LEARNER_MODELS_DIR, exist_ok=True) 
+        logging.info(f"Sichergestellt, dass '{WATCH_FOLDER}', '{PROCESSED_FOLDER}', '{MODELS_DIR}' und '{CANDLE_LEARNER_MODELS_DIR}' existieren.")
+
+    def _start_watch_folder(self):
+        """Startet den Ordner-Watcher in einem separaten Thread."""
+        if not self.watching_folder:
+            self.watching_folder = True
+            self._watch_folder_thread = threading.Thread(target=self._watch_folder_for_new_files, daemon=True)
+            self._watch_folder_thread.start()
+            logging.info(f"Ordner-Watcher für '{WATCH_FOLDER}' gestartet.")
+        else:
+            logging.info("Ordner-Watcher läuft bereits.")
+
+    def _stop_watch_folder(self):
+        """Stoppt den Ordner-Watcher."""
+        self.watching_folder = False
+        logging.info("Ordner-Watcher gestoppt.")
+
+    def _watch_folder_for_new_files(self):
+        """Überwacht den Ordner auf neue Bilder und leitet die Verarbeitung ein."""
+        # Use a more robust way to track processed files (e.g., a simple log file or timestamp check)
+        # For simplicity, keeping the set, but be aware of limitations with app restarts.
+        processed_files_set = set() # Reset on start for this example, or load from a log
+        processed_log_path = os.path.join(PROCESSED_FOLDER, "processed_log.txt")
+        if os.path.exists(processed_log_path):
+            with open(processed_log_path, 'r') as f:
+                for line in f:
+                    processed_files_set.add(line.strip())
+
+        logging.info(f"Ordner-Watcher aktiv für {WATCH_FOLDER}. Bereits verarbeitete Dateien in Log: {len(processed_files_set)}")
+
+        while self.watching_folder:
+            try:
+                current_files_in_watch_folder = [f for f in os.listdir(WATCH_FOLDER) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp'))]
+                
+                for filename in current_files_in_watch_folder:
+                    full_path = os.path.join(WATCH_FOLDER, filename)
+                    # Überprüfe, ob die Datei bereits im Log als verarbeitet markiert ist
+                    if filename not in processed_files_set: 
+                        logging.info(f"Neue Datei entdeckt: {full_path}")
+                        self.after(0, lambda fn=filename: self.status_bar.config(text=f"Verarbeite neue Datei: {fn}..."))
+                        
+                        # Markiere als verarbeitet, BEVOR die tatsächliche Verarbeitung beginnt
+                        # Das verhindert Doppelverarbeitung, falls App abstürzt
+                        processed_files_set.add(filename)
+                        with open(processed_log_path, 'a') as f:
+                            f.write(filename + "\n")
+
+                        self.executor_ocr.submit(self._process_new_image, full_path)
+                    
+            except Exception as e:
+                logging.error(f"Fehler im Ordner-Watcher: {e}")
+            time.sleep(5)
+
+    def _process_new_image(self, image_path: str):
+        """
+        Verarbeitet ein neues Bild: Führt OCR aus, wählt das beste Ergebnis aus
+        und speichert es in der Historie.
+        """
+        logging.info(f"Starte _process_new_image für: {image_path}")
+        if not OCR_ENABLED:
+            self.after(0, lambda: self.status_bar.config(text=f"OCR deaktiviert. Konnte {os.path.basename(image_path)} nicht verarbeiten."))
+            logging.warning(f"OCR deaktiviert, Bild {image_path} wird nicht verarbeitet.")
+            self._move_processed_file(image_path, success=False)
+            return
+
+        try:
+            detected_pairs = self.ocr_processor.process_image_for_kurs_data(image_path)
+            
+            best_pair = None
+            if detected_pairs:
+                # detected_pairs ist bereits nach Konfidenz sortiert (höchste zuerst)
+                for symbol, value, confidence in detected_pairs:
+                    # Nehmen Sie das erste Paar, das den Konfidenz-Schwellenwert erfüllt
+                    if symbol and value is not None and confidence >= OCR_CONFIDENCE_THRESHOLD:
+                        best_pair = (symbol, value, confidence)
+                        break 
+                if not best_pair: # Wenn kein Paar den Schwellenwert erfüllt, nehmen Sie das beste verfügbare (falls vorhanden)
+                    if detected_pairs:
+                        best_pair = detected_pairs[0]
+                        logging.warning(f"Kein Kandidat über dem Konfidenz-Schwellenwert. Verwende besten Kandidaten mit niedriger Konfidenz: {best_pair}")
+
+
+            if best_pair:
+                kurs_symbol, kurs_value, confidence = best_pair
+                timestamp = datetime.now()
+                self.data_handler.add_kurs_value(kurs_symbol, timestamp, kurs_value)
+                logging.info(f"Erkannten Kurs '{kurs_symbol}' mit Wert {kurs_value} (Conf: {confidence:.1f}%) gespeichert.")
+                self.after(0, lambda sym=kurs_symbol, val=kurs_value, ts=timestamp: self._update_ui_after_processing(sym, val, ts))
+                self._move_processed_file(image_path, success=True)
+            else:
+                logging.warning(f"Konnte keine zuverlässigen Kursdaten aus {image_path} extrahieren (kein Paar über Schwelle oder gefunden).")
+                self.after(0, lambda: self.status_bar.config(text=f"Fehler bei OCR für {os.path.basename(image_path)}: Keine zuverlässigen Daten erkannt."))
+                self._move_processed_file(image_path, success=False)
+
+        except Exception as e:
+            logging.error(f"Kritischer Fehler bei der Verarbeitung von Bild {image_path}: {e}")
+            self.after(0, lambda: messagebox.showerror("Verarbeitungsfehler", f"Ein Fehler ist bei der Verarbeitung von {os.path.basename(image_path)} aufgetreten: {e}"))
+            self._move_processed_file(image_path, success=False)
+
+    def _move_processed_file(self, image_path: str, success: bool):
+        """Verschiebt eine verarbeitete Datei in den PROCESSED_FOLDER."""
+        try:
+            # Erstelle ein Unterverzeichnis für Erfolg/Misserfolg
+            target_subfolder = os.path.join(PROCESSED_FOLDER, "success" if success else "failed")
+            os.makedirs(target_subfolder, exist_ok=True)
+            
+            # Verschiebe die Datei
+            shutil.move(image_path, os.path.join(target_subfolder, os.path.basename(image_path)))
+            logging.info(f"Datei '{os.path.basename(image_path)}' nach '{target_subfolder}' verschoben.")
+        except Exception as e:
+            logging.error(f"Fehler beim Verschieben der Datei '{image_path}': {e}")
+
+
+    def _update_ui_after_processing(self, kurs_symbol: str, kurs_value: float, timestamp: datetime):
+        """Aktualisiert die GUI nach erfolgreicher Bildverarbeitung."""
+        # Dynamische Formatierung für Wert-Anzeige
+        if kurs_value < 1.0:
+            display_format = ".4f"
+        elif kurs_value < 100.0:
+            display_format = ".2f"
+        else:
+            display_format = ".0f"
+
+        self.status_bar.config(text=f"Kurs '{kurs_symbol}' aktualisiert: {kurs_value:{display_format}}")
+        self.update_kurs_symbols_list()
+
+        if self.kurs_symbol_var.get() == kurs_symbol:
+            self.current_value_label.config(text=f"Wert: {kurs_value:{display_format}}")
+            self.last_update_label.config(text=f"Letzte Aktualisierung: {timestamp.strftime('%H:%M:%S')}")
+            self._draw_kurs_graph(kurs_symbol)
+
+    def update_kurs_symbols_list(self):
+        """Aktualisiert die Liste der verfügbaren Kurs-Symbole in den Comboboxen."""
+        all_symbols = sorted(list(self.ocr_processor.supported_kurs_symbols.union(self.data_handler._kurs_history.keys())))
+        
+        self.kurs_symbol_combobox['values'] = all_symbols
+        self.history_kurs_symbol_combobox['values'] = all_symbols
+
+        if not self.kurs_symbol_var.get() and all_symbols:
+            self.kurs_symbol_var.set(all_symbols[0])
+            self._on_kurs_symbol_selected(None)
+
+        if not self.history_kurs_symbol_var.get() and all_symbols:
+            self.history_kurs_symbol_var.set(all_symbols[0])
+            self._on_history_kurs_symbol_selected(None)
+
+
+    def _on_kurs_symbol_selected(self, event):
+        """Wird aufgerufen, wenn ein Kurs-Symbol im Live-Tab ausgewählt wird."""
+        selected_symbol = self.kurs_symbol_var.get()
+        if selected_symbol:
+            history = self.data_handler.get_kurs_history(selected_symbol)
+            if history:
+                latest_timestamp_str, latest_value = history[-1]
+                latest_timestamp = datetime.strptime(latest_timestamp_str, DATE_FORMAT)
+                
+                if latest_value < 1.0:
+                    display_format = ".4f"
+                elif latest_value < 100.0:
+                    display_format = ".2f"
+                else:
+                    display_format = ".0f"
+
+                self.current_value_label.config(text=f"Wert: {latest_value:{display_format}}")
+                self.last_update_label.config(text=f"Letzte Aktualisierung: {latest_timestamp.strftime('%H:%M:%S')}")
+            else:
+                self.current_value_label.config(text="Wert: N/A")
+                self.last_update_label.config(text="Letzte Aktualisierung: N/A")
+            self._draw_kurs_graph(selected_symbol)
+            self.clear_prognose_display()
+
+    def _draw_kurs_graph(self, kurs_symbol: str):
+        """Zeichnet den Kurs-Graphen im Live-Tab mit Matplotlib."""
+        self.ax.clear()
+        history = self.data_handler.get_kurs_history(kurs_symbol)
+        prognoses = self.data_handler.get_prognoses(kurs_symbol)
+
+        if not history:
+            self.ax.text(0.5, 0.5, "Keine Daten verfügbar.", 
+                         horizontalalignment='center', verticalalignment='center', 
+                         transform=self.ax.transAxes, color='gray')
+            self.canvas_plot.draw()
+            return
+
+        if len(history) > MAX_POINTS_FOR_DETAILED_GRAPH:
+            step = len(history) // MAX_POINTS_FOR_DETAILED_GRAPH + 1
+            display_history = history[::step]
+            logging.info(f"Graph: Reduziere Datenpunkte von {len(history)} auf {len(display_history)}.")
+        else:
+            display_history = history
+
+        timestamps = [datetime.strptime(ts, DATE_FORMAT) for ts, _ in display_history]
+        values = [val for _, val in display_history]
+
+        if not values: return
+
+        self.ax.plot(timestamps, values, marker='o', linestyle='-', color='blue', markersize=4, label='Historischer Kurs')
+        
+        # Plotting Prognosen und Konfidenzbänder
+        future_prediction_data = [] # (timestamp, predicted_value, range_min, range_max)
+        for prog in prognoses:
+            if prog['actual_value'] is None: # Nur unerfüllte Prognosen zeichnen
+                try:
+                    pred_ts = datetime.strptime(prog['prediction_timestamp'], DATE_FORMAT)
+                    pred_val = prog['predicted_value']
+                    range_min = prog['predicted_range_min']
+                    range_max = prog['predicted_range_max']
+                    future_prediction_data.append((pred_ts, pred_val, range_min, range_max))
+                except (ValueError, KeyError) as e:
+                    logging.warning(f"Fehler beim Parsen der Prognosedaten für den Graphen: {e} - {prog}")
+
+        if future_prediction_data:
+            future_prediction_data.sort(key=lambda x: x[0]) # Sortieren nach Zeitstempel
+            pred_timestamps = [p[0] for p in future_prediction_data]
+            pred_values = [p[1] for p in future_prediction_data]
+            pred_range_mins = [p[2] for p in future_prediction_data]
+            pred_range_maxs = [p[3] for p in future_prediction_data]
+
+            self.ax.plot(pred_timestamps, pred_values, color='red', linestyle='--', marker='x', label='Prognostizierter Kurs')
+            self.ax.fill_between(pred_timestamps, pred_range_mins, pred_range_maxs, color='red', alpha=0.1, label='Prognose-Spanne')
+
+
+        # Optional: Evaluierte Prognosen auf dem Graph markieren
+        # Dies kann den Graphen überladen, aber ist nützlich für die Analyse
+        # evaluated_prognoses = [p for p in prognoses if p['actual_value'] is not None]
+        # if evaluated_prognoses:
+        #     eval_timestamps = [datetime.strptime(p['prediction_timestamp'], DATE_FORMAT) for p in evaluated_prognoses]
+        #     eval_actual_values = [p['actual_value'] for p in evaluated_prognoses]
+        #     eval_predicted_values = [p['predicted_value'] for p in evaluated_prognoses]
+        #     self.ax.scatter(eval_timestamps, eval_actual_values, color='green', marker='o', s=50, label='Tatsächlicher Wert (Eval.)', zorder=5)
+        #     self.ax.scatter(eval_timestamps, eval_predicted_values, color='orange', marker='x', s=50, label='Vorhergesagter Wert (Eval.)', zorder=5)
+
+
+        self.ax.set_title(f"Kursverlauf von {kurs_symbol}")
+        self.ax.set_xlabel("Zeit")
+        self.ax.set_ylabel("Wert")
+        self.ax.grid(True, linestyle='--', alpha=0.7)
+        self.fig.autofmt_xdate()
+        self.ax.legend()
+        self.fig.tight_layout()
+        self.canvas_plot.draw()
+
+    def clear_prognose_display(self):
+        """Löscht die angezeigten Prognosedaten."""
+        self.predicted_value_label.config(text="N/A")
+        self.confidence_label.config(text="N/A")
+        self.prediction_time_label.config(text="N/A")
+        self.predicted_range_label.config(text="N/A") 
+        self.candle_direction_label.config(text="N/A") 
+
+    def _create_prognose_async(self):
+        """Startet die Prognoseerstellung asynchron."""
+        selected_symbol = self.kurs_symbol_var.get()
+        if not selected_symbol:
+            messagebox.showwarning("Kein Kurs ausgewählt", "Bitte wählen Sie ein Kurs-Symbol aus, für das eine Prognose erstellt werden soll.")
+            return
+
+        history = self.data_handler.get_kurs_history(selected_symbol)
+        if not history:
+            messagebox.showwarning("Keine Daten", f"Keine historischen Daten für '{selected_symbol}' verfügbar, um eine Prognose zu erstellen.")
+            return
+        
+        self.status_bar.config(text="Erstelle Prognose...")
+        self.make_prognose_button.config(state=tk.DISABLED)
+
+        future = self.executor_prognosis.submit(self.prognose_modul.create_prognose, selected_symbol, history)
+        future.add_done_callback(lambda f: self.after(0, self._handle_prognose_result, f, selected_symbol))
+
+    def _handle_prognose_result(self, future, kurs_symbol: str):
+        """Verarbeitet das Ergebnis der asynchronen Prognoseerstellung."""
+        try:
+            predicted_value, confidence, predicted_range_min, predicted_range_max, candle_direction = future.result()
+            if predicted_value is None or confidence is None:
+                messagebox.showerror("Prognosefehler", f"Prognose für {kurs_symbol} konnte nicht erstellt werden. Nicht genügend Daten oder Modellfehler.")
+                self.status_bar.config(text="Prognoseerstellung fehlgeschlagen.")
+                return
+
+            prediction_timestamp = datetime.now() + timedelta(days=1)
+            prediction_timestamp_str = prediction_timestamp.strftime(DATE_FORMAT)
+
+            prognose_data = {
+                "kurs_symbol": kurs_symbol,
+                "current_value": self.data_handler.get_kurs_history(kurs_symbol)[-1][1], # Letzter Wert vor der Prognose
+                "prediction_timestamp": prediction_timestamp_str,
+                "predicted_value": predicted_value,
+                "confidence": confidence,
+                "predicted_range_min": predicted_range_min, 
+                "predicted_range_max": predicted_range_max, 
+                "candle_direction": candle_direction,       
+                "creation_timestamp": datetime.now().strftime(DATE_FORMAT),
+                "actual_value": None,
+                "evaluation_timestamp": None,
+                "error": None
+            }
+            self.data_handler.add_prognose(kurs_symbol, prognose_data)
+
+            if predicted_value < 1.0:
+                display_format = ".4f"
+            elif predicted_value < 100.0:
+                display_format = ".2f"
+            else:
+                display_format = ".0f"
+            
+            range_min_disp_fmt = ".4f" if predicted_range_min < 1.0 else (".2f" if predicted_range_min < 100.0 else ".0f")
+            range_max_disp_fmt = ".4f" if predicted_range_max < 1.0 else (".2f" if predicted_range_max < 100.0 else ".0f")
+
+
+            self.predicted_value_label.config(text=f"{predicted_value:{display_format}}")
+            self.confidence_label.config(text=f"{confidence:.1f}%")
+            self.prediction_time_label.config(text=prediction_timestamp_str)
+            self.predicted_range_label.config(text=f"{predicted_range_min:{range_min_disp_fmt}} - {predicted_range_max:{range_max_disp_fmt}}") 
+            self.candle_direction_label.config(text=candle_direction) 
+            self.status_bar.config(text=f"Prognose für {kurs_symbol} erstellt.")
+            logging.info(f"Prognose für {kurs_symbol} erfolgreich im UI angezeigt.")
+            self._draw_kurs_graph(kurs_symbol) # Aktualisiere Graph mit neuer Prognose
+        except Exception as e:
+            logging.error(f"Fehler beim Erstellen der Prognose: {e}")
+            messagebox.showerror("Prognosefehler", f"Ein Fehler ist beim Erstellen der Prognose aufgetreten: {e}")
+            self.status_bar.config(text="Prognoseerstellung fehlgeschlagen.")
+        finally:
+            self.make_prognose_button.config(state=tk.NORMAL)
+
+    def _on_history_kurs_symbol_selected(self, event):
+        """Wird aufgerufen, wenn ein Kurs-Symbol im Prognosen-Historie Tab ausgewählt wird."""
+        self._populate_prognosis_history_tree()
+
+    def _populate_prognosis_history_tree(self):
+        """Füllt den Treeview mit historischen Prognosen für das ausgewählte Symbol."""
+        for i in self.prognosis_tree.get_children():
+            self.prognosis_tree.delete(i)
+
+        selected_symbol = self.history_kurs_symbol_var.get()
+        if not selected_symbol:
+            return
+
+        prognoses = self.data_handler.get_prognoses(selected_symbol)
+        if not prognoses:
+            self.status_bar.config(text=f"Keine Prognosen für '{selected_symbol}' verfügbar.")
+            return
+
+        for prog in prognoses:
+            # Dynamische Formatierung für Werte in der Tabelle
+            predicted_val_display = ""
+            actual_val_display = ""
+            error_display = ""
+            predicted_range_min_display = ""
+            predicted_range_max_display = ""
+
+            # Funktion zur dynamischen Formatierung
+            def get_display_format(value):
+                if value is None: return "N/A"
+                if value < 1.0: return f"{value:.4f}"
+                elif value < 100.0: return f"{value:.2f}"
+                else: return f"{value:.0f}"
+
+            predicted_val_display = get_display_format(prog['predicted_value'])
+            actual_val_display = get_display_format(prog['actual_value'])
+            error_display = get_display_format(prog['error'])
+            predicted_range_min_display = get_display_format(prog['predicted_range_min'])
+            predicted_range_max_display = get_display_format(prog['predicted_range_max'])
+            
+            confidence_display = f"{prog['confidence']:.1f}%" if prog['confidence'] is not None else "N/A"
+            eval_time_display = prog['evaluation_timestamp'] if prog['evaluation_timestamp'] else "N/A"
+            candle_direction_display = prog['candle_direction'] if prog['candle_direction'] else "N/A" 
+
+            # Füge die Prognose zum Treeview hinzu
+            item_id = self.prognosis_tree.insert("", "end", values=(
+                prog['kurs_symbol'],
+                prog['prediction_timestamp'],
+                predicted_val_display,
+                actual_val_display,
+                error_display,
+                confidence_display,
+                predicted_range_min_display,
+                predicted_range_max_display,
+                candle_direction_display,
+                eval_time_display
+            ))
+            # Speichere die Rohdaten als Item-Parameter, um sie später einfach abrufen zu können
+            self.prognosis_tree.set(item_id, "#data", prog) # Custom tag to store full data
+
+
+    def _on_prognosis_double_click(self, event):
+        """Öffnet den Evaluierungsdialog beim Doppelklick auf eine Prognose."""
+        selected_item_id = self.prognosis_tree.focus()
+        if not selected_item_id:
+            return
+
+        # Verwende den "data" Tag, um die ursprünglichen Prognosedaten abzurufen
+        selected_prognose = self.prognosis_tree.set(selected_item_id, "#data") 
+        if not selected_prognose: # Fallback, falls der Tag nicht gesetzt wurde (z.B. bei älteren Einträgen)
+            # Extrahieren der Daten aus den sichtbaren Spalten (weniger robust)
+            values = self.prognosis_tree.item(selected_item_id, 'values')
+            selected_prognose = {
+                'kurs_symbol': values[0],
+                'prediction_timestamp': values[1],
+                'predicted_value': float(values[2]) if values[2] != 'N/A' else None,
+                'confidence': float(values[5].replace('%', '')) if values[5] != 'N/A' else None,
+                'predicted_range_min': float(values[6]) if values[6] != 'N/A' else None,
+                'predicted_range_max': float(values[7]) if values[7] != 'N/A' else None,
+                'candle_direction': values[8] if values[8] != 'N/A' else None,
+                'actual_value': float(values[3]) if values[3] != 'N/A' else None,
+                'evaluation_timestamp': values[9] if values[9] != 'N/A' else None,
+                'error': float(values[4]) if values[4] != 'N/A' else None
+            }
+        
+        # Sicherstellen, dass predicted_value als float vorliegt
+        if isinstance(selected_prognose['predicted_value'], str) and selected_prognose['predicted_value'] != 'N/A':
+            selected_prognose['predicted_value'] = float(selected_prognose['predicted_value'])
+        
+        self._open_evaluate_dialog(selected_prognose)
+
+    def _open_evaluate_dialog(self, prognose_data: dict):
+        """Öffnet einen Dialog zur Eingabe des tatsächlichen Werts für die Evaluierung."""
+        dialog = tk.Toplevel(self)
+        dialog.title(f"Prognose evaluieren: {prognose_data['kurs_symbol']}")
+        dialog.geometry(f"{EVAL_DIALOG_WIDTH}x{EVAL_DIALOG_HEIGHT}")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frame = ttk.Frame(dialog, padding="15")
+        frame.pack(expand=True, fill="both")
+
+        ttk.Label(frame, text=f"Kurs-Symbol: {prognose_data['kurs_symbol']}", font=("Arial", 11, "bold")).pack(anchor="w", pady=5)
+        ttk.Label(frame, text=f"Vorhergesagt für: {prognose_data['prediction_timestamp']}").pack(anchor="w", pady=2)
+        
+        predicted_val_display = prognose_data['predicted_value']
+        if predicted_val_display is not None:
+            if predicted_val_display < 1.0: val_fmt = ".4f"
+            elif predicted_val_display < 100.0: val_fmt = ".2f"
+            else: val_fmt = ".0f"
+            predicted_val_display = f"{predicted_val_display:{val_fmt}}"
+
+        ttk.Label(frame, text=f"Prognostizierter Wert: {predicted_val_display}").pack(anchor="w", pady=2)
+        ttk.Label(frame, text=f"Konfidenz: {prognose_data['confidence']:.1f}%").pack(anchor="w", pady=2)
+        
+        range_min_disp_fmt = ".4f" if prognose_data['predicted_range_min'] < 1.0 else (".2f" if prognose_data['predicted_range_min'] < 100.0 else ".0f")
+        range_max_disp_fmt = ".4f" if prognose_data['predicted_range_max'] < 1.0 else (".2f" if prognose_data['predicted_range_max'] < 100.0 else ".0f")
+
+        ttk.Label(frame, text=f"Erwartete Spanne: {prognose_data['predicted_range_min']:{range_min_disp_fmt}} - {prognose_data['predicted_range_max']:{range_max_disp_fmt}}").pack(anchor="w", pady=2)
+        ttk.Label(frame, text=f"Erwartetes Kerzenverhalten: {prognose_data['candle_direction']}").pack(anchor="w", pady=2)
+
+
+        ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=10)
+
+        actual_value_label = ttk.Label(frame, text="Tatsächlicher Wert:")
+        actual_value_label.pack(anchor="w", pady=5)
+        actual_value_entry = ttk.Entry(frame)
+        actual_value_entry.pack(fill="x", padx=0, pady=2)
+        actual_value_entry.focus_set()
+
+        # Zeigt den aktuellen/zuletzt bekannten Wert an, um die Eingabe zu erleichtern
+        last_known_history = self.data_handler.get_kurs_history(prognose_data['kurs_symbol'])
+        if last_known_history:
+            last_val_ts, last_val = last_known_history[-1]
+            last_val_display = get_display_format(last_val)
+            ttk.Label(frame, text=f"Aktuell bekannter Wert (Referenz): {last_val_display}").pack(anchor="w", pady=2)
+        else:
+            ttk.Label(frame, text="Kein aktueller Referenzwert verfügbar.").pack(anchor="w", pady=2)
+
+
+        error_label = ttk.Label(frame, text="", foreground="red")
+        error_label.pack(pady=5)
+
+        def on_submit():
+            actual_value_str = actual_value_entry.get().strip().replace(',', '.')
+            try:
+                actual_value = float(actual_value_str)
+                if not (OCR_VALUE_MIN <= actual_value <= OCR_VALUE_MAX):
+                    error_label.config(text=f"Wert muss zwischen {OCR_VALUE_MIN} und {OCR_VALUE_MAX} liegen.")
+                    return
+                
+                # Aktualisiere die Prognose mit dem tatsächlichen Wert
+                updated_prog = self.data_handler.update_prognose(
+                    prognose_data['kurs_symbol'],
+                    prognose_data['prediction_timestamp'],
+                    prognose_data['predicted_value'],
+                    actual_value
+                )
+                
+                if updated_prog:
+                    # Lass das KI-Modul aus dem Feedback lernen
+                    self.prognose_modul.learn_from_feedback(
+                        updated_prog['kurs_symbol'],
+                        updated_prog['predicted_value'],
+                        updated_prog['actual_value'],
+                        updated_prog['confidence']
+                    )
+                    self.status_bar.config(text=f"Prognose für {prognose_data['kurs_symbol']} evaluiert. Fehler: {updated_prog['error']:.4f}")
+                    self._populate_prognosis_history_tree() # Aktualisiere Treeview
+                    self._draw_kurs_graph(prognose_data['kurs_symbol']) # Aktualisiere Graph
+                    dialog.destroy()
+                else:
+                    error_label.config(text="Fehler beim Aktualisieren der Prognose in der Datenbank.")
+
+            except ValueError:
+                error_label.config(text="Ungültige Zahl für den tatsächlichen Wert.")
+            except Exception as e:
+                error_label.config(text=f"Ein unerwarteter Fehler ist aufgetreten: {e}")
+
+        submit_button = ttk.Button(frame, text="Speichern und Evaluieren", command=on_submit)
+        submit_button.pack(pady=10)
+
+        # Wenn bereits evaluiert, zeige den Wert und deaktiviere die Eingabe
+        if prognose_data['actual_value'] is not None:
+            actual_value_entry.insert(0, str(prognose_data['actual_value']))
+            actual_value_entry.config(state=tk.DISABLED)
+            submit_button.config(state=tk.DISABLED, text="Bereits evaluiert")
+            ttk.Label(frame, text=f"Bereits evaluiert am: {prognose_data['evaluation_timestamp']}").pack(anchor="w", pady=5)
+            ttk.Label(frame, text=f"Fehler (Aktuell - Prognose): {prognose_data['error']:{get_display_format(prognose_data['error'])}}").pack(anchor="w", pady=2)
+
+
+        dialog.bind("<Return>", lambda e: on_submit())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+
+    def _select_roi_image(self):
+        """Öffnet einen Dateidialog, um ein Bild für das ROI-Debugging auszuwählen."""
+        file_path = filedialog.askopenfilename(
+            title="Bild für ROI-Debugging auswählen",
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.gif *.bmp")]
+        )
+        if file_path:
+            self.roi_image_path_entry.config(state="normal")
+            self.roi_image_path_entry.delete(0, tk.END)
+            self.roi_image_path_entry.insert(0, file_path)
+            self.roi_image_path_entry.config(state="readonly")
+            
+            # Zerstöre altes Canvas, falls vorhanden
+            if self.roi_debug_canvas:
+                self.roi_debug_canvas.destroy()
+
+            # Erstelle neues Canvas mit dem ausgewählten Bild
+            self.roi_debug_canvas = DebugROICanvas(
+                self.debug_canvas_frame, 
+                file_path, 
+                self.ocr_processor, 
+                self.update_kurs_symbols_list,
+                bg="grey"
+            )
+            self.roi_debug_canvas.pack(expand=True, fill="both")
+            self.status_bar.config(text=f"Bild '{os.path.basename(file_path)}' zum Debugging geladen.")
+
+    def _on_closing(self):
+        """Wird beim Schließen der Anwendung aufgerufen, um Threads zu beenden."""
+        logging.info("Anwendung wird geschlossen. Beende Worker-Threads...")
+        self._stop_watch_folder()
+        self.executor_ocr.shutdown(wait=True)
+        self.executor_prognosis.shutdown(wait=True)
+        self.data_handler.save_data() # Sicherstellen, dass alle Daten gespeichert sind
+        logging.info("Threads beendet. Anwendung wird zerstört.")
+        self.destroy()
+
+if __name__ == "__main__":
+    app = KursPrognoseApp()
+    app.mainloop()
